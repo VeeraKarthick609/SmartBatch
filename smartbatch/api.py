@@ -7,12 +7,18 @@ from typing import List, Any
 import logging
 
 from smartbatch.batching import InferenceRequest, get_request_queue
+from smartbatch.metrics import get_metrics
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+@router.get("/metrics")
+def metrics_endpoint():
+    return get_metrics().get_stats()
+
+
 class PredictRequest(BaseModel):
-    data: List[float]
+    data: Any # Allow nested lists for tensors
 
 class PredictResponse(BaseModel):
     result: Any
@@ -24,6 +30,13 @@ async def predict(request: PredictRequest):
     """
     Enqueue inference request and await result.
     """
+    from smartbatch.batching import get_shutdown_event
+    if get_shutdown_event().is_set():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Server is shutting down"
+        )
+
     request_id = str(uuid.uuid4())
     queue = get_request_queue()
     
@@ -61,6 +74,9 @@ async def predict(request: PredictRequest):
         # Calculate processing time
         duration = time.time() - inference_req.enqueue_time
         
+        # Record metric
+        get_metrics().record_request(duration)
+
         return PredictResponse(
             result=result,
             request_id=request_id,

@@ -27,3 +27,8 @@ def get_request_queue() -> asyncio.Queue:
 def init_request_queue(maxsize: int = 100):
     global request_queue
     request_queue = asyncio.Queue(maxsize=maxsize)
+
+SHUTDOWN_EVENT = asyncio.Event()
+
+def get_shutdown_event() -> asyncio.Event:
+    return SHUTDOWN_EVENT

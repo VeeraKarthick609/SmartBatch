@@ -38,17 +38,34 @@ async def batch_worker():
     queue = get_request_queue()
     
     batch: List[InferenceRequest] = []
+    from smartbatch.batching import get_shutdown_event
+    shutdown_event = get_shutdown_event()
     
-    while True:
+    # Loop while running OR (Shutting down AND Queue has items)
+    while not shutdown_event.is_set() or not queue.empty() or batch:
         try:
             # 1. Fetch first request (Blocking)
             # If batch is empty, we wait indefinitely for the first item
             if not batch:
-                req = await queue.get()
-                batch.append(req)
+                if shutdown_event.is_set() and queue.empty():
+                    break # Done
                 
-                # Start the timer for this batch
-                deadline = asyncio.get_running_loop().time() + MAX_WAIT_TIME
+                try:
+                    # If shutting down, don't wait forever
+                    timeout = 1.0 if shutdown_event.is_set() else None
+                    if timeout:
+                         req = await asyncio.wait_for(queue.get(), timeout=timeout)
+                    else:
+                         req = await queue.get()
+                         
+                    batch.append(req)
+                    # Start the timer for this batch
+                    deadline = asyncio.get_running_loop().time() + MAX_WAIT_TIME
+                except asyncio.TimeoutError:
+                     # Queue empty and ensure shutdown check loop
+                     continue
+
+            # 2. Accumulate more requests until triggered
             
             # 2. Accumulate more requests until triggered
             while len(batch) < MAX_BATCH_SIZE:
@@ -76,8 +93,14 @@ async def batch_worker():
                 
                 try:
                     # Run Inference
+                    t0_inf = asyncio.get_running_loop().time()
                     results = model.infer(inputs)
+                    t1_inf = asyncio.get_running_loop().time()
                     
+                    # Record Batch Metrics
+                    from smartbatch.metrics import get_metrics
+                    get_metrics().record_batch(len(batch), t1_inf - t0_inf)
+
                     # Set Results
                     for req, res in zip(batch, results):
                         if not req.future.done():
@@ -117,10 +140,25 @@ async def lifespan(app: FastAPI):
     yield
     
     # Shutdown
-    logger.info("Shutting down...")
-    worker_task.cancel()
+    logger.info("Shutting down... Draining queue.")
+    
+    # 1. Signal shutdown to API (stop accepting new reqs)
+    from smartbatch.batching import get_shutdown_event
+    get_shutdown_event().set()
+    
+    # 2. Wait for worker to finish (it should Exit only when queue is empty)
+    # We might need to cancel it if it takes too long, but let's try graceful first
     try:
-        await worker_task
+        # Give it some time to drain? Or wait indefinitely?
+        # For Day 3 Goal: "Drain queue".
+        # We need to update worker loop condition first!
+        # The worker currently loops `while True`. 
+        # We need to signal the worker to stop? 
+        # Actually, if we set the event, we can change the worker loop condition.
+        await asyncio.wait_for(worker_task, timeout=10.0) # 10s grace
+    except asyncio.TimeoutError:
+        logger.warning("Shutdown timed out, cancelling worker...")
+        worker_task.cancel()
     except asyncio.CancelledError:
         pass
 

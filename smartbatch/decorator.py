@@ -3,30 +3,40 @@ import time
 import logging
 from typing import Callable, List, Any, Optional, Union
 from functools import wraps
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 logger = logging.getLogger("smartbatch.decorator")
 
-@dataclass
+@dataclass(order=True)
 class _BatchedRequest:
-    payload: Any
-    future: asyncio.Future
+    priority: int
     enqueue_time: float
+    # Future is not comparable, so we exclude it from ordering or place it last
+    # We use field(compare=False)
+    payload: Any = field(compare=False)
+    future: asyncio.Future = field(compare=False)
 
 class Batcher:
     """
     Manages the batching logic for a specific target function.
+    Uses PriorityQueue for adaptive backpressure.
     """
     def __init__(self, 
                  func: Callable[[List[Any]], Any], 
                  max_batch_size: int, 
                  max_wait_time: float,
-                 input_schema: Optional[Any] = None):
+                 input_schema: Optional[Any] = None,
+                 max_queue_size: int = 128):
         self.func = func
         self.max_batch_size = max_batch_size
         self.max_wait_time = max_wait_time
         self.input_schema = input_schema
-        self.queue: asyncio.Queue[_BatchedRequest] = asyncio.Queue()
+        self.max_queue_size = max_queue_size
+        
+        # PriorityQueue: (priority, timestamp, item)
+        # Priority 0 = High (Retry/VIP)
+        # Priority 10 = Normal
+        self.queue: asyncio.PriorityQueue[_BatchedRequest] = asyncio.PriorityQueue(maxsize=max_queue_size)
         self.shutdown_event = asyncio.Event()
         self.worker_task: Optional[asyncio.Task] = None
         
@@ -43,40 +53,55 @@ class Batcher:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
             
-    async def process_single(self, item: Any):
+    async def process_single(self, item: Any, priority: int = 10):
         """
         Public entry point: Enqueue a single item and wait for the batch result.
         """
         # --- Validation Layer ---
         if self.input_schema:
-            # If item is a dict, convert to Pydantic model
             if isinstance(item, dict):
                 try:
-                    # Support Pydantic V2 and V1
                     if hasattr(self.input_schema, "model_validate"):
                         item = self.input_schema.model_validate(item)
                     else:
                         item = self.input_schema.parse_obj(item)
                 except Exception as e:
-                    # Re-raise as ValueError or let it bubble up (FastAPI handles it)
                     raise ValueError(f"Input validation failed: {e}")
             elif not isinstance(item, self.input_schema):
-                 # Strict type check if not dict
                  raise TypeError(f"Expected {self.input_schema.__name__}, got {type(item)}")
 
-        # Ensure worker is running (lazy start)
+        # Ensure worker is running
         if self.worker_task is None:
             await self.start()
             
         loop = asyncio.get_running_loop()
         future = loop.create_future()
+        
         req = _BatchedRequest(
+            priority=priority,
+            enqueue_time=time.time(),
             payload=item,
-            future=future,
-            enqueue_time=time.time()
+            future=future
         )
         
-        await self.queue.put(req)
+        # --- Backpressure / Retry Logic ---
+        try:
+            # Try to enqueue immediately
+            self.queue.put_nowait(req)
+        except asyncio.QueueFull:
+            # Queue is full. Back off and retry with higher priority.
+            # logger.warning("Queue full, retrying with high priority...")
+            await asyncio.sleep(0.05) # Wait 50ms
+            
+            # Retry with Priority 0 (High)
+            req.priority = 0
+            try:
+                # Wait up to 1s to squeeze in
+                await asyncio.wait_for(self.queue.put(req), timeout=1.0)
+            except asyncio.TimeoutError:
+                # Still full after retry -> Hard Failure
+                raise RuntimeError("Service overloaded: Queue full after retry")
+        
         return await future
 
     async def _worker_loop(self):
@@ -146,15 +171,18 @@ class Batcher:
                 logger.error(f"Worker crashed: {e}")
                 await asyncio.sleep(1)
 
-def batch(max_batch_size: int = 32, max_wait_time: float = 0.01, input_schema: Optional[Any] = None):
+def batch(max_batch_size: int = 32, 
+          max_wait_time: float = 0.01, 
+          input_schema: Optional[Any] = None,
+          max_queue_size: int = 128):
     """
     Decorator to convert a List->List function into a Single->Single async function 
     that automatically batches requests in the background.
     """
     def decorator(func):
         # Create a single Batcher instance for this function definition
-        # Note: This means all calls to this decorated function share the same queue
-        batcher = Batcher(func, max_batch_size, max_wait_time, input_schema=input_schema)
+        batcher = Batcher(func, max_batch_size, max_wait_time, 
+                          input_schema=input_schema, max_queue_size=max_queue_size)
         
         @wraps(func)
         async def wrapper(item: Any):

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smartbatch"
+version = "0.1.0"
+description = "High-throughput ML inference middleware with dynamic batching"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "User", email = "user@example.com"}
+]
+dependencies = [
+    "fastapi>=0.68.0",
+    "uvicorn>=0.15.0",
+    "torch>=2.0.0",
+    "numpy>=1.21.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "locust",
+    "requests"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["smartbatch*"]

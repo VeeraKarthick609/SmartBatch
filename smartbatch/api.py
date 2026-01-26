@@ -1,24 +1,43 @@
 import asyncio
 import uuid
 import time
+import os
+import logging
+from typing import List, Any
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
-from typing import List, Any
-import logging
-
-from smartbatch.batching import InferenceRequest, get_request_queue
+from smartbatch.decorator import batch
+from smartbatch.model import ModelWrapper
 from smartbatch.metrics import get_metrics
 
-router = APIRouter()
 logger = logging.getLogger(__name__)
+router = APIRouter()
+
+# --- Configuration ---
+MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "32"))
+MAX_WAIT_TIME = float(os.getenv("MAX_WAIT_TIME", "0.01"))
+MODEL_PATH = os.getenv("MODEL_PATH", None)
+
+# --- Model & Batching Setup ---
+# Initialize model globally (lazy loading ensures it doesn't crash on import)
+model = ModelWrapper(model_path=MODEL_PATH)
+
+@batch(max_batch_size=MAX_BATCH_SIZE, max_wait_time=MAX_WAIT_TIME)
+async def run_inference(inputs: List[Any]) -> List[Any]:
+    """
+    The actual batch processing function.
+    Receives a list of inputs, runs model inference, returns list of outputs.
+    """
+    return model.infer(inputs)
+
+# --- API Endpoints ---
 
 @router.get("/metrics")
 def metrics_endpoint():
     return get_metrics().get_stats()
 
-
 class PredictRequest(BaseModel):
-    data: Any # Allow nested lists for tensors
+    data: Any 
 
 class PredictResponse(BaseModel):
     result: Any
@@ -28,53 +47,16 @@ class PredictResponse(BaseModel):
 @router.post("/predict", response_model=PredictResponse)
 async def predict(request: PredictRequest):
     """
-    Enqueue inference request and await result.
+    Endpoint using the decorator-based batcher.
     """
-    from smartbatch.batching import get_shutdown_event
-    if get_shutdown_event().is_set():
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Server is shutting down"
-        )
-
     request_id = str(uuid.uuid4())
-    queue = get_request_queue()
-    
-    # Create valid inference request
-    loop = asyncio.get_running_loop()
-    future = loop.create_future()
-    
-    inference_req = InferenceRequest(
-        request_id=request_id,
-        payload=request.data,
-        future=future
-    )
+    start_time = time.time()
     
     try:
-        # Enqueue with timeout/backpressure check could happen here
-        # For now, standard put (will block if full, or we can use put_nowait)
-        if queue.full():
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Server is busy, try again later."
-            )
+        # Simply call the decorated function with a single item
+        result = await run_inference(request.data)
         
-        queue.put_nowait(inference_req)
-        
-    except asyncio.QueueFull:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Server is busy"
-        )
-        
-    try:
-        # Await the result
-        result = await future
-        
-        # Calculate processing time
-        duration = time.time() - inference_req.enqueue_time
-        
-        # Record metric
+        duration = time.time() - start_time
         get_metrics().record_request(duration)
 
         return PredictResponse(
@@ -85,4 +67,7 @@ async def predict(request: PredictRequest):
         
     except Exception as e:
         logger.error(f"Inference failed for {request_id}: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        if "Server is shutting down" in str(e):
+             status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        raise HTTPException(status_code=status_code, detail=str(e))

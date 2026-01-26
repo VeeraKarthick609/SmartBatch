@@ -57,13 +57,31 @@ While the Baseline's latency explodes exponentially as the queue fills, SmartBat
 
 ## 🏃 Usage
 
-### 1. Start the Server
-Run the production server with customizable batch settings:
+### 1. The Decorator Pattern (Recommended)
+Add `@batch` to any async function to automatically group requests.
+
+```python
+from smartbatch import batch
+from typing import List
+
+# 1. Define your batched function (List -> List)
+@batch(max_batch_size=32, max_wait_time=0.01)
+async def run_model(batch_inputs: List[float]) -> List[float]:
+    # This runs ONLY when a batch is full or timeout matches
+    return model.predict(batch_inputs)
+
+# 2. Call it normally (Single Item -> Single Item)
+# The decorator handles queueing and waiting!
+result = await run_model(single_input)
+```
+
+### 2. Start the Server
+Run the included production server:
 ```bash
 # Example: Batch size 32, Max wait 10ms
 export MAX_BATCH_SIZE=32
 export MAX_WAIT_TIME=0.01
-export MODEL_PATH="resnet18" # Uses torchvision default
+export MODEL_PATH="resnet18"
 
 uvicorn smartbatch.main:app --host 0.0.0.0 --port 8000
 ```

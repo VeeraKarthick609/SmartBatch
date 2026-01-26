@@ -32,9 +32,13 @@ async def run_inference(inputs: List[Any]) -> List[Any]:
 
 # --- API Endpoints ---
 
+from starlette.responses import Response
+from prometheus_client import CONTENT_TYPE_LATEST
+
 @router.get("/metrics")
 def metrics_endpoint():
-    return get_metrics().get_stats()
+    data = get_metrics().get_stats()
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 class PredictRequest(BaseModel):
     data: Any 
@@ -67,6 +71,40 @@ async def predict(request: PredictRequest):
         
     except Exception as e:
         logger.error(f"Inference failed for {request_id}: {e}")
+        status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        if "Server is shutting down" in str(e):
+             status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        raise HTTPException(status_code=status_code, detail=str(e))
+
+@router.post("/models/{model_name}/predict", response_model=PredictResponse)
+async def predict_model(model_name: str, request: PredictRequest):
+    """
+    Dynamic endpoint for registered models.
+    """
+    from smartbatch.registry import get_model
+    
+    handler = get_model(model_name)
+    if not handler:
+        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
+        
+    request_id = str(uuid.uuid4())
+    start_time = time.time()
+    
+    try:
+        # Call the registered handler (which should be decorated with @batch)
+        result = await handler(request.data)
+        
+        duration = time.time() - start_time
+        get_metrics().record_request(duration)
+
+        return PredictResponse(
+            result=result,
+            request_id=request_id,
+            processing_time=duration
+        )
+        
+    except Exception as e:
+        logger.error(f"Inference failed for {request_id} on model {model_name}: {e}")
         status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
         if "Server is shutting down" in str(e):
              status_code = status.HTTP_503_SERVICE_UNAVAILABLE

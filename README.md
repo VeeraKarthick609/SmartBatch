@@ -72,7 +72,21 @@ async def run_model(batch_inputs: List[float]) -> List[float]:
 
 # 2. Call it normally (Single Item -> Single Item)
 # The decorator handles queueing and waiting!
-result = await run_model(single_input)
+result = await run_model(single_input) 
+```
+
+### 2. Multi-Model Registry
+To serve multiple models on dynamic routes (`/models/{name}/predict`), use `@register`:
+
+```python
+from smartbatch import batch, register
+
+@register(name="yolo")
+@batch(max_batch_size=8)
+async def run_yolo(batch: List):
+    return yolo_model(batch)
+
+# Now available at: POST /models/yolo/predict
 ```
 
 ### 2. Start the Server

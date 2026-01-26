@@ -1,9 +1,10 @@
 import asyncio
 import logging
+from typing import List
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from smartbatch.api import router
-from smartbatch.batching import init_request_queue, get_request_queue
+from smartbatch.batching import init_request_queue, get_request_queue, InferenceRequest
 
 # Configure logging
 logging.basicConfig(
@@ -12,36 +13,97 @@ logging.basicConfig(
 )
 logger = logging.getLogger("smartbatch")
 
+import os
+
+# Configuration from Environment Variables
+MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "32"))
+MAX_WAIT_TIME = float(os.getenv("MAX_WAIT_TIME", "0.01")) # 10ms
+MODEL_PATH = os.getenv("MODEL_PATH", None)
+
 async def batch_worker():
     """
-    Dummy worker for Day 1.
-    Dequeues requests and returns immediately.
+    Core Batch Processing Loop.
+    Accumulates requests until MAX_BATCH_SIZE or MAX_WAIT_TIME is reached.
     """
-    logger.info("Batch worker started")
+    logger = logging.getLogger("smartbatch.worker")
+    logger.info(f"Batch worker started with BatchSize={MAX_BATCH_SIZE}, Wait={MAX_WAIT_TIME}")
+    
+    # Initialize Model
+    from smartbatch.model import ModelWrapper
+    # Lazy init will happen inside model wrapper, but we pass path here
+    model = ModelWrapper(model_path=MODEL_PATH)
+    # Trigger load immediately to be ready (optional, but good for logs)
+    # model.load() 
+    
     queue = get_request_queue()
+    
+    batch: List[InferenceRequest] = []
     
     while True:
         try:
-            req = await queue.get()
+            # 1. Fetch first request (Blocking)
+            # If batch is empty, we wait indefinitely for the first item
+            if not batch:
+                req = await queue.get()
+                batch.append(req)
+                
+                # Start the timer for this batch
+                deadline = asyncio.get_running_loop().time() + MAX_WAIT_TIME
             
-            # Day 1 Logic: Immediate dummy result
-            # Log enqueue/dequeue latency
-            now = asyncio.get_running_loop().time()
-            # Note: req.enqueue_time is from time.time(), so we mix clocks slightly but okay for logging
+            # 2. Accumulate more requests until triggered
+            while len(batch) < MAX_BATCH_SIZE:
+                now = asyncio.get_running_loop().time()
+                remaining = deadline - now
+                
+                if remaining <= 0:
+                    logger.debug("Batch timeout triggered")
+                    break
+                
+                try:
+                    # Wait for next item with timeout
+                    req = await asyncio.wait_for(queue.get(), timeout=remaining)
+                    batch.append(req)
+                except asyncio.TimeoutError:
+                    logger.debug("Batch timeout reached during wait")
+                    break
             
-            logger.info(f"Processing request {req.request_id}")
-            
-            # Simulate work? No, requirement says "Immediate future.set_result"
-            # But making it async/await safe
-            req.future.set_result([0.99] * len(req.payload) if isinstance(req.payload, list) else "dummy_result")
-            
-            queue.task_done()
-            
+            # 3. Process Batch
+            if batch:
+                logger.info(f"Processing batch of size {len(batch)}")
+                
+                # Extract payloads
+                inputs = [req.payload for req in batch]
+                
+                try:
+                    # Run Inference
+                    results = model.infer(inputs)
+                    
+                    # Set Results
+                    for req, res in zip(batch, results):
+                        if not req.future.done():
+                            req.future.set_result(res)
+                            
+                except Exception as e:
+                    logger.error(f"Batch inference failed: {e}")
+                    # Fail all requests in this batch
+                    for req in batch:
+                        if not req.future.done():
+                            req.future.set_exception(e)
+                finally:
+                    # Mark tasks as done in queue
+                    for _ in batch:
+                        queue.task_done()
+                    
+                    # Reset batch
+                    batch = []
+
         except asyncio.CancelledError:
             logger.info("Worker cancelled")
             break
         except Exception as e:
-            logger.error(f"Worker error: {e}")
+            logger.error(f"Worker critical error: {e}")
+            # Prevent busy loop if something goes really wrong
+            await asyncio.sleep(1)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

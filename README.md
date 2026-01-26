@@ -125,31 +125,6 @@ async def infer(batch, worker_id=0):
     return model(batch)
 ```
 
-### 2. Start the Server
-Run the included production server:
-```bash
-# Example: Batch size 32, Max wait 10ms
-export MAX_BATCH_SIZE=32
-export MAX_WAIT_TIME=0.01
-export MODEL_PATH="resnet18"
-
-uvicorn smartbatch.main:app --host 0.0.0.0 --port 8000
-```
-
-### 2. Send Requests
-You can send requests containing image data (nested lists or flattened arrays):
-```bash
-curl -X POST "http://localhost:8000/predict" \
-     -H "Content-Type: application/json" \
-     -d '{"data": [[0.1, 0.2, ...]]}'
-```
-
-### 3. Check Metrics
-Monitor system health and performance in real-time:
-```bash
-curl http://localhost:8000/metrics
-```
-
 ## 🧪 Benchmarking
 
 Reproduce the performance results yourself using the included benchmark suite.

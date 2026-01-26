@@ -24,16 +24,6 @@ We conducted a rigorous 1-hour stress test comparing **SmartBatch** against a **
 | **Median Latency (p50)** | > 1000s (Collapsed) | **~13s** (Stable) | **~99% Reduction** |
 | **Tail Latency (p95)** | Unstable / Timeouts | Controlled by Batching | **Stabilized** |
 
-### Performance Visualization
-
-**1. Throughput Stability**
-SmartBatch maintains significantly higher requests-per-second (RPS) under heavy load compared to the baseline, which collapses due to contention.
-![Throughput Graph](production_throughput.png)
-
-**2. Latency Control**
-While the Baseline's latency explodes exponentially as the queue fills, SmartBatch keeps latency stable by processing efficiently in batches.
-![Latency Graph](production_latency_p50.png)
-
 ---
 
 ## 🛠️ Installation
@@ -116,6 +106,23 @@ async def safe_inference(batch: List[ImageInput]):
     # 'batch' contains valid Pydantic objects now!
     inputs = [item.data for item in batch]
     return model.predict(inputs)
+```
+
+### 5. Multi-GPU / Multi-Worker Support
+Scale verticaly by running multiple worker loops. Use `worker_id` to select devices.
+
+```python
+# Models loaded on different GPUs
+models = {
+    0: load_model("cuda:0"),
+    1: load_model("cuda:1")
+}
+
+@batch(max_batch_size=32, workers=2)
+async def infer(batch, worker_id=0):
+    # SmartBatch injects 'worker_id' (0 or 1) automatically
+    model = models[worker_id]
+    return model(batch)
 ```
 
 ### 2. Start the Server

@@ -26,31 +26,38 @@ class Batcher:
                  max_batch_size: int, 
                  max_wait_time: float,
                  input_schema: Optional[Any] = None,
-                 max_queue_size: int = 128):
+                 max_queue_size: int = 128,
+                 workers: int = 1):
         self.func = func
         self.max_batch_size = max_batch_size
         self.max_wait_time = max_wait_time
         self.input_schema = input_schema
         self.max_queue_size = max_queue_size
+        self.workers = workers
         
         # PriorityQueue: (priority, timestamp, item)
         # Priority 0 = High (Retry/VIP)
         # Priority 10 = Normal
         self.queue: asyncio.PriorityQueue[_BatchedRequest] = asyncio.PriorityQueue(maxsize=max_queue_size)
         self.shutdown_event = asyncio.Event()
-        self.worker_task: Optional[asyncio.Task] = None
+        self.worker_tasks: List[asyncio.Task] = []
         
     async def start(self):
-        if self.worker_task is None or self.worker_task.done():
+        # Clean up finished tasks
+        self.worker_tasks = [t for t in self.worker_tasks if not t.done()]
+        
+        if not self.worker_tasks:
             self.shutdown_event.clear()
-            self.worker_task = asyncio.create_task(self._worker_loop())
+            for i in range(self.workers):
+                t = asyncio.create_task(self._worker_loop(worker_id=i))
+                self.worker_tasks.append(t)
             
     async def stop(self):
         self.shutdown_event.set()
-        if self.worker_task:
+        if self.worker_tasks:
             try:
-                await asyncio.wait_for(self.worker_task, timeout=5.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.gather(*self.worker_tasks), timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 pass
             
     async def process_single(self, item: Any, priority: int = 10):
@@ -71,7 +78,7 @@ class Batcher:
                  raise TypeError(f"Expected {self.input_schema.__name__}, got {type(item)}")
 
         # Ensure worker is running
-        if self.worker_task is None:
+        if not self.worker_tasks:
             await self.start()
             
         loop = asyncio.get_running_loop()
@@ -104,18 +111,15 @@ class Batcher:
         
         return await future
 
-    async def _worker_loop(self):
-        logger.info(f"Batch worker started for {self.func.__name__}")
+    async def _worker_loop(self, worker_id: int):
+        logger.info(f"Batch worker {worker_id} started for {self.func.__name__}")
         batch: List[_BatchedRequest] = []
         
         while not self.shutdown_event.is_set():
             try:
                 # 1. Fetch first item (blocking wait)
                 if not batch:
-                    # calculating wait based on nothing, just wait standard
                     try:
-                        # If we have a shutdown signal, we might still want to process remaining items?
-                        # For now, simple check
                         req = await asyncio.wait_for(self.queue.get(), timeout=1.0)
                         batch.append(req)
                     except asyncio.TimeoutError:
@@ -141,14 +145,21 @@ class Batcher:
                 if batch:
                     inputs = [b.payload for b in batch]
                     try:
-                        # Call the user's batched function
-                        # Detect if it's a coroutine or regular func? 
-                        # We assume async for now as per design
-                        if asyncio.iscoroutinefunction(self.func):
-                            results = await self.func(inputs)
-                        else:
-                            # Run sync function in thread pool to avoid blocking loop
-                            results = await asyncio.to_thread(self.func, inputs)
+                        # Call user function with optional worker_id injection
+                        try:
+                            if asyncio.iscoroutinefunction(self.func):
+                                results = await self.func(inputs, worker_id=worker_id)
+                            else:
+                                results = await asyncio.to_thread(self.func, inputs, worker_id=worker_id)
+                        except TypeError as te:
+                             if "worker_id" in str(te):
+                                 # Function doesn't accept worker_id
+                                 if asyncio.iscoroutinefunction(self.func):
+                                     results = await self.func(inputs)
+                                 else:
+                                     results = await asyncio.to_thread(self.func, inputs)
+                             else:
+                                 raise te
                             
                         if len(results) != len(inputs):
                              raise ValueError(f"Batch function returned {len(results)} items, expected {len(inputs)}")
@@ -168,13 +179,14 @@ class Batcher:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Worker crashed: {e}")
+                logger.error(f"Worker {worker_id} crashed: {e}")
                 await asyncio.sleep(1)
 
 def batch(max_batch_size: int = 32, 
           max_wait_time: float = 0.01, 
           input_schema: Optional[Any] = None,
-          max_queue_size: int = 128):
+          max_queue_size: int = 128,
+          workers: int = 1):
     """
     Decorator to convert a List->List function into a Single->Single async function 
     that automatically batches requests in the background.
@@ -182,7 +194,7 @@ def batch(max_batch_size: int = 32,
     def decorator(func):
         # Create a single Batcher instance for this function definition
         batcher = Batcher(func, max_batch_size, max_wait_time, 
-                          input_schema=input_schema, max_queue_size=max_queue_size)
+                          input_schema=input_schema, max_queue_size=max_queue_size, workers=workers)
         
         @wraps(func)
         async def wrapper(item: Any):

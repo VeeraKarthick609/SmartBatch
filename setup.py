@@ -7,6 +7,9 @@ setup(
     install_requires=[
         "fastapi",
         "uvicorn",
+        "pydantic",
+        "prometheus_client",
+        "msgpack",
         "torch",
         "numpy",
     ],

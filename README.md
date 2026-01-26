@@ -75,7 +75,19 @@ async def run_model(batch_inputs: List[float]) -> List[float]:
 result = await run_model(single_input) 
 ```
 
-### 2. Multi-Model Registry
+### 2. Binary Transport (MsgPack)
+For high-performance clients, send binary packed data instead of JSON to reduce payload size.
+
+**Header**: `Content-Type: application/msgpack`
+**Body**: MsgPack encoded dict (e.g., `{"data": [...]}`) or raw list `[...]`.
+
+```python
+import msgpack, requests
+payload = msgpack.packb([0.1, 0.2, 0.3])
+requests.post("http://localhost:8000/predict", data=payload, headers={"Content-Type": "application/msgpack"})
+```
+
+### 3. Multi-Model Registry
 To serve multiple models on dynamic routes (`/models/{name}/predict`), use `@register`:
 
 ```python

@@ -20,10 +20,12 @@ class Batcher:
     def __init__(self, 
                  func: Callable[[List[Any]], Any], 
                  max_batch_size: int, 
-                 max_wait_time: float):
+                 max_wait_time: float,
+                 input_schema: Optional[Any] = None):
         self.func = func
         self.max_batch_size = max_batch_size
         self.max_wait_time = max_wait_time
+        self.input_schema = input_schema
         self.queue: asyncio.Queue[_BatchedRequest] = asyncio.Queue()
         self.shutdown_event = asyncio.Event()
         self.worker_task: Optional[asyncio.Task] = None
@@ -45,6 +47,23 @@ class Batcher:
         """
         Public entry point: Enqueue a single item and wait for the batch result.
         """
+        # --- Validation Layer ---
+        if self.input_schema:
+            # If item is a dict, convert to Pydantic model
+            if isinstance(item, dict):
+                try:
+                    # Support Pydantic V2 and V1
+                    if hasattr(self.input_schema, "model_validate"):
+                        item = self.input_schema.model_validate(item)
+                    else:
+                        item = self.input_schema.parse_obj(item)
+                except Exception as e:
+                    # Re-raise as ValueError or let it bubble up (FastAPI handles it)
+                    raise ValueError(f"Input validation failed: {e}")
+            elif not isinstance(item, self.input_schema):
+                 # Strict type check if not dict
+                 raise TypeError(f"Expected {self.input_schema.__name__}, got {type(item)}")
+
         # Ensure worker is running (lazy start)
         if self.worker_task is None:
             await self.start()
@@ -127,7 +146,7 @@ class Batcher:
                 logger.error(f"Worker crashed: {e}")
                 await asyncio.sleep(1)
 
-def batch(max_batch_size: int = 32, max_wait_time: float = 0.01):
+def batch(max_batch_size: int = 32, max_wait_time: float = 0.01, input_schema: Optional[Any] = None):
     """
     Decorator to convert a List->List function into a Single->Single async function 
     that automatically batches requests in the background.
@@ -135,7 +154,7 @@ def batch(max_batch_size: int = 32, max_wait_time: float = 0.01):
     def decorator(func):
         # Create a single Batcher instance for this function definition
         # Note: This means all calls to this decorated function share the same queue
-        batcher = Batcher(func, max_batch_size, max_wait_time)
+        batcher = Batcher(func, max_batch_size, max_wait_time, input_schema=input_schema)
         
         @wraps(func)
         async def wrapper(item: Any):

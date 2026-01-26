@@ -89,6 +89,23 @@ async def run_yolo(batch: List):
 # Now available at: POST /models/yolo/predict
 ```
 
+### 3. Input Schema Validation (Recommended)
+Protect your workers by enforcing Pydantic schemas. Invalid requests (e.g. string instead of int) will raise an error *before* queueing.
+
+```python
+from pydantic import BaseModel
+
+class ImageInput(BaseModel):
+    data: List[float]
+    threshold: float = 0.5
+
+@batch(max_batch_size=32, input_schema=ImageInput)
+async def safe_inference(batch: List[ImageInput]):
+    # 'batch' contains valid Pydantic objects now!
+    inputs = [item.data for item in batch]
+    return model.predict(inputs)
+```
+
 ### 2. Start the Server
 Run the included production server:
 ```bash

@@ -91,7 +91,7 @@ async def run_yolo(batch: List):
 # Now available at: POST /models/yolo/predict
 ```
 
-### 3. Input Schema Validation (Recommended)
+### 4. Input Schema Validation (Recommended)
 Protect your workers by enforcing Pydantic schemas. Invalid requests (e.g. string instead of int) will raise an error *before* queueing.
 
 ```python

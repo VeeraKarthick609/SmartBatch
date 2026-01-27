@@ -4,6 +4,7 @@ import logging
 from typing import Callable, List, Any, Optional, Union
 from functools import wraps
 from dataclasses import dataclass, field
+from smartbatch.exceptions import OverloadedError
 
 logger = logging.getLogger("smartbatch.decorator")
 
@@ -16,6 +17,8 @@ class _BatchedRequest:
     payload: Any = field(compare=False)
     future: asyncio.Future = field(compare=False)
 
+logging.basicConfig(level=logging.INFO)
+
 class Batcher:
     """
     Manages the batching logic for a specific target function.
@@ -27,18 +30,26 @@ class Batcher:
                  max_wait_time: float,
                  input_schema: Optional[Any] = None,
                  max_queue_size: int = 128,
-                 workers: int = 1):
+                 workers: int = 1,
+                 target_latency: Optional[float] = None):
         self.func = func
         self.max_batch_size = max_batch_size
+        self.current_batch_size_limit = max_batch_size # Adaptive limit
         self.max_wait_time = max_wait_time
         self.input_schema = input_schema
         self.max_queue_size = max_queue_size
         self.workers = workers
+        self.target_latency = target_latency
         
         # PriorityQueue: (priority, timestamp, item)
         # Priority 0 = High (Retry/VIP)
         # Priority 10 = Normal
-        self.queue: asyncio.PriorityQueue[_BatchedRequest] = asyncio.PriorityQueue(maxsize=max_queue_size)
+        # Per-GPU/Worker queues
+        # Handle 0 workers case carefully (for testing backpressure)
+        self.queues: List[asyncio.PriorityQueue[_BatchedRequest]] = [
+            asyncio.PriorityQueue(maxsize=max_queue_size) for _ in range(max(1, workers))
+        ]
+
         self.shutdown_event = asyncio.Event()
         self.worker_tasks: List[asyncio.Task] = []
         
@@ -92,9 +103,24 @@ class Batcher:
         )
         
         # --- Backpressure / Retry Logic ---
+        
+        # Load Balancing: Find shortest queue
+        # For approximation, we just check qsize. 
+        # In high concurrency, this is racy but acceptable.
+        
+        # If workers=0 (testing), we just use queue[0]
+        # But we need to simulate load balancing if workers > 1.
+        
+        best_queue_idx = 0
+        if self.workers > 1:
+             # Find index with min size
+             best_queue_idx = min(range(len(self.queues)), key=lambda i: self.queues[i].qsize())
+        
+        target_queue = self.queues[best_queue_idx]
+
         try:
             # Try to enqueue immediately
-            self.queue.put_nowait(req)
+            target_queue.put_nowait(req)
         except asyncio.QueueFull:
             # Queue is full. Back off and retry with higher priority.
             # logger.warning("Queue full, retrying with high priority...")
@@ -104,10 +130,10 @@ class Batcher:
             req.priority = 0
             try:
                 # Wait up to 1s to squeeze in
-                await asyncio.wait_for(self.queue.put(req), timeout=1.0)
+                await asyncio.wait_for(target_queue.put(req), timeout=1.0)
             except asyncio.TimeoutError:
                 # Still full after retry -> Hard Failure
-                raise RuntimeError("Service overloaded: Queue full after retry")
+                raise OverloadedError("Service overloaded: Queue full after retry")
         
         return await future
 
@@ -115,12 +141,16 @@ class Batcher:
         logger.info(f"Batch worker {worker_id} started for {self.func.__name__}")
         batch: List[_BatchedRequest] = []
         
+        # Determine which queue this worker listens to. 
+        # If workers match queues, 1:1 map.
+        my_queue = self.queues[worker_id % len(self.queues)]
+        
         while not self.shutdown_event.is_set():
             try:
                 # 1. Fetch first item (blocking wait)
                 if not batch:
                     try:
-                        req = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                        req = await asyncio.wait_for(my_queue.get(), timeout=1.0)
                         batch.append(req)
                     except asyncio.TimeoutError:
                         continue
@@ -128,15 +158,22 @@ class Batcher:
                 # 2. Accumulate
                 deadline = batch[0].enqueue_time + self.max_wait_time
                 
-                while len(batch) < self.max_batch_size:
+                while len(batch) < self.current_batch_size_limit:
                     now = time.time()
                     remaining = deadline - now
                     
                     if remaining <= 0:
+                        # Try to fill batch from queue without waiting
+                        try:
+                            while len(batch) < self.current_batch_size_limit:
+                                req = my_queue.get_nowait()
+                                batch.append(req)
+                        except asyncio.QueueEmpty:
+                            pass
                         break
                         
                     try:
-                        req = await asyncio.wait_for(self.queue.get(), timeout=remaining)
+                        req = await asyncio.wait_for(my_queue.get(), timeout=remaining)
                         batch.append(req)
                     except asyncio.TimeoutError:
                         break
@@ -145,6 +182,7 @@ class Batcher:
                 if batch:
                     inputs = [b.payload for b in batch]
                     try:
+                        start_time = time.time()
                         # Call user function with optional worker_id injection
                         try:
                             if asyncio.iscoroutinefunction(self.func):
@@ -160,6 +198,24 @@ class Batcher:
                                      results = await asyncio.to_thread(self.func, inputs)
                              else:
                                  raise te
+
+                        exec_duration = time.time() - start_time
+                        print(f"DEBUG: Batch size: {len(batch)}, Duration: {exec_duration}, Target: {self.target_latency}")
+
+                        # --- Adaptive Batching Logic ---
+                        if self.target_latency:
+                             # Multiplicative Decrease
+                             if exec_duration > self.target_latency:
+                                 old_limit = self.current_batch_size_limit
+                                 self.current_batch_size_limit = max(1, int(self.current_batch_size_limit * 0.8))
+                                 if self.current_batch_size_limit != old_limit:
+                                     print(f"High latency ({exec_duration:.3f}s). Reducing batch size to {self.current_batch_size_limit}")
+                             
+                             # Additive Increase
+                             elif exec_duration < self.target_latency * 0.8:
+                                  if self.current_batch_size_limit < self.max_batch_size:
+                                      self.current_batch_size_limit += 1 
+                                      # logger.debug(f"Low latency. Increasing batch size to {self.current_batch_size_limit}")
                             
                         if len(results) != len(inputs):
                              raise ValueError(f"Batch function returned {len(results)} items, expected {len(inputs)}")
@@ -186,7 +242,8 @@ def batch(max_batch_size: int = 32,
           max_wait_time: float = 0.01, 
           input_schema: Optional[Any] = None,
           max_queue_size: int = 128,
-          workers: int = 1):
+          workers: int = 1,
+          target_latency: Optional[float] = None):
     """
     Decorator to convert a List->List function into a Single->Single async function 
     that automatically batches requests in the background.
@@ -194,7 +251,8 @@ def batch(max_batch_size: int = 32,
     def decorator(func):
         # Create a single Batcher instance for this function definition
         batcher = Batcher(func, max_batch_size, max_wait_time, 
-                          input_schema=input_schema, max_queue_size=max_queue_size, workers=workers)
+                          input_schema=input_schema, max_queue_size=max_queue_size, workers=workers,
+                          target_latency=target_latency)
         
         @wraps(func)
         async def wrapper(item: Any):

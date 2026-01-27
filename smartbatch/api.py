@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from smartbatch.decorator import batch
 from smartbatch.model import ModelWrapper
 from smartbatch.metrics import get_metrics
+from smartbatch.exceptions import OverloadedError
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -74,6 +75,8 @@ async def predict_model(model_name: str, request: PredictRequest):
     except Exception as e:
         logger.error(f"Inference failed for {request_id} on model {model_name}: {e}")
         status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
-        if "Server is shutting down" in str(e):
+        if isinstance(e, OverloadedError):
+             status_code = status.HTTP_429_TOO_MANY_REQUESTS
+        elif "Server is shutting down" in str(e):
              status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         raise HTTPException(status_code=status_code, detail=str(e))

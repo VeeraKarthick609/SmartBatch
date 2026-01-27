@@ -5,6 +5,9 @@
 ## 🚀 Key Features
 
 *   **Dynamic Batching**: Automatically groups requests into batches (up to `MAX_BATCH_SIZE`) or processes them after a timeout (`MAX_WAIT_TIME`), striking the perfect balance between throughput and latency.
+*   **Latency-Aware Adaptive Batching**: Dynamically adjusts batch sizes based on real-time execution duration to meet SLA targets (`target_latency`).
+*   **Hard Backpressure**: Protects your system by shedding load with HTTP 429 when queues are full, preventing cascading failures.
+*   **Per-GPU Queues**: Ensures strict isolation between workers, preventing stalls on one GPU from blocking others.
 *   **Asynchronous API**: Built on `FastAPI` and `asyncio` to handle thousands of concurrent connections efficiently.
 *   **Production Robustness**: Includes graceful shutdown, proper error handling, and thread-safe metrics.
 *   **Real-World Load Testing**: Benchmarking suite included to simulate high-concurrency traffic with realistic payloads.
@@ -55,7 +58,8 @@ from smartbatch import batch
 from typing import List
 
 # 1. Define your batched function (List -> List)
-@batch(max_batch_size=32, max_wait_time=0.01)
+# target_latency=0.05 enables adaptive batching (50ms target)
+@batch(max_batch_size=32, max_wait_time=0.01, target_latency=0.05)
 async def run_model(batch_inputs: List[float]) -> List[float]:
     # This runs ONLY when a batch is full or timeout matches
     return model.predict(batch_inputs)
@@ -124,6 +128,9 @@ async def infer(batch, worker_id=0):
     model = models[worker_id]
     return model(batch)
 ```
+
+### 6. Failure Isolation
+SmartBatch uses **per-worker queues**. If Worker 0 is stalled (e.g. GPU hang), Worker 1 continues to process requests from its own queue. Load balancing automatically routes new requests to the shortest queue.
 
 ## 🧪 Benchmarking
 

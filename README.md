@@ -33,7 +33,7 @@ We conducted a rigorous 1-hour stress test comparing **SmartBatch** against a **
 
 1.  **Clone the repository**:
     ```bash
-    git clone https://github.com/yourusername/SmartBatch.git
+    git clone https://github.com/VeeraKarthick609/SmartBatch.git
     cd SmartBatch
     ```
 

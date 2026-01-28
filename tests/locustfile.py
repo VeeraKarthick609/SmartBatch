@@ -47,4 +47,4 @@ class InferenceUser(HttpUser):
     @task
     def predict(self):
         img_data = random.choice(IMAGES)
-        self.client.post("/predict", json={"data": img_data})
+        self.client.post("/models/benchmark/predict", json={"data": img_data})

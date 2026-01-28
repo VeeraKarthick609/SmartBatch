@@ -25,3 +25,7 @@ def get_model(name: str) -> Optional[Callable]:
 
 def get_all_models() -> Dict[str, Callable]:
     return _registry
+
+def reset_registry():
+    """Clear the registry. Useful for testing."""
+    _registry.clear()

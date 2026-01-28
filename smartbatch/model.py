@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import List, Any
 
-class BaseModel(ABC):
+class ModelWrapper(ABC):
     """
     Abstract base class for models served by SmartBatch.
     Users are not required to inherit from this, but it serves as a good template.

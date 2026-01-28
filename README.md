@@ -156,7 +156,8 @@ SmartBatch/
 ├── smartbatch/          # Core Package
 │   ├── main.py          # Entry point & App lifecycle
 │   ├── api.py           # FastAPI endpoints
-│   ├── batching.py      # Batch logic & Queue management
+│   ├── decorator.py     # Batching logic & Queue management
+│   ├── registry.py      # Model registry
 │   ├── model.py         # PyTorch Model Wrapper
 │   └── metrics.py       # Thread-safe metrics collection
 ├── scripts/             # Utilities

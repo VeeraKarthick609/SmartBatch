@@ -4,6 +4,7 @@ import logging
 from typing import Callable, List, Any, Optional, Union
 from functools import wraps
 from dataclasses import dataclass, field
+from collections import deque
 from smartbatch.exceptions import OverloadedError
 
 logger = logging.getLogger("smartbatch.decorator")
@@ -52,6 +53,9 @@ class Batcher:
 
         self.shutdown_event = asyncio.Event()
         self.worker_tasks: List[asyncio.Task] = []
+        # Moving average for adaptive batching
+        self.recent_latencies: deque = deque(maxlen=10)
+
         
     async def start(self):
         # Clean up finished tasks
@@ -123,7 +127,7 @@ class Batcher:
             target_queue.put_nowait(req)
         except asyncio.QueueFull:
             # Queue is full. Back off and retry with higher priority.
-            # logger.warning("Queue full, retrying with high priority...")
+            logger.warning("Queue full, retrying with high priority...")
             await asyncio.sleep(0.05) # Wait 50ms
             
             # Retry with Priority 0 (High)
@@ -156,7 +160,11 @@ class Batcher:
                         continue
                 
                 # 2. Accumulate
-                deadline = batch[0].enqueue_time + self.max_wait_time
+                # Use current time for deadline to maximize batching opportunity, 
+                # instead of enqueue time which might be stale.
+                # Or use enqueue time if we want to enforce strict total latency.
+                # Given "max_wait_time" usually implies "wait for more items", base it on first item fetch.
+                deadline = time.time() + self.max_wait_time
                 
                 while len(batch) < self.current_batch_size_limit:
                     now = time.time()
@@ -200,22 +208,27 @@ class Batcher:
                                  raise te
 
                         exec_duration = time.time() - start_time
-                        print(f"DEBUG: Batch size: {len(batch)}, Duration: {exec_duration}, Target: {self.target_latency}")
+                        logger.debug(f"Batch size: {len(batch)}, Duration: {exec_duration:.4f}s, Target: {self.target_latency}")
 
                         # --- Adaptive Batching Logic ---
                         if self.target_latency:
+                             self.recent_latencies.append(exec_duration)
+                             avg_latency = sum(self.recent_latencies) / len(self.recent_latencies)
+                             
                              # Multiplicative Decrease
-                             if exec_duration > self.target_latency:
+                             if avg_latency > self.target_latency:
                                  old_limit = self.current_batch_size_limit
                                  self.current_batch_size_limit = max(1, int(self.current_batch_size_limit * 0.8))
                                  if self.current_batch_size_limit != old_limit:
-                                     print(f"High latency ({exec_duration:.3f}s). Reducing batch size to {self.current_batch_size_limit}")
+                                     logger.info(f"High latency (avg {avg_latency:.3f}s). Reducing batch size to {self.current_batch_size_limit}")
+                                     self.recent_latencies.clear() # Reset to avoid double penalizing
                              
                              # Additive Increase
-                             elif exec_duration < self.target_latency * 0.8:
+                             elif avg_latency < self.target_latency * 0.8:
                                   if self.current_batch_size_limit < self.max_batch_size:
                                       self.current_batch_size_limit += 1 
-                                      # logger.debug(f"Low latency. Increasing batch size to {self.current_batch_size_limit}")
+                                      logger.debug(f"Low latency. Increasing batch size to {self.current_batch_size_limit}")
+                                      # No clear here, gradual increase is fine
                             
                         if len(results) != len(inputs):
                              raise ValueError(f"Batch function returned {len(results)} items, expected {len(inputs)}")

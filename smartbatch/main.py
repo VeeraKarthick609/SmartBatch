@@ -3,7 +3,7 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
-from smartbatch.api import router, run_inference
+from smartbatch.api import router
 from smartbatch.registry import register
 
 # Configure logging

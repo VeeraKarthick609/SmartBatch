@@ -49,7 +49,7 @@ def run_server(bs, wait, port):
     env["MAX_WAIT_TIME"] = str(wait)
     
     proc = subprocess.Popen(
-        ["venv/bin/uvicorn", "smartbatch.main:app", "--host", "0.0.0.0", "--port", str(port)],
+        ["venv/bin/uvicorn", "scripts.benchmark_app:app", "--host", "0.0.0.0", "--port", str(port)],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE

@@ -15,11 +15,19 @@
 
 ## 📊 Benchmark Results (Stress Test)
 
-We conducted a rigorous 1-hour stress test comparing **SmartBatch** against a **Baseline** (no batching) implementation.
+We conducted a rigorous stress test comparing **SmartBatch** against a **Baseline** (no batching) implementation.
 
 **Hardware**: Single Node (Simulated Production Environment)
 **Load**: 200-1000 Concurrent Users
 **Payload**: Real-world images (ResNet18 inputs)
+
+### Latency vs Cumulative Requests
+![Latency Comparison](assets/comparison_latency_requests.png)
+*Stable latency even as request count grows, unlike the baseline which collapses.*
+
+### Throughput vs Cumulative Requests
+![Throughput Comparison](assets/comparison_throughput_requests.png)
+*Higher and more consistent throughput.*
 
 | Metric | Baseline (Sequential) | SmartBatch (Batched) | Improvement |
 | :--- | :--- | :--- | :--- |
@@ -132,39 +140,4 @@ async def infer(batch, worker_id=0):
 ### 6. Failure Isolation
 SmartBatch uses **per-worker queues**. If Worker 0 is stalled (e.g. GPU hang), Worker 1 continues to process requests from its own queue. Load balancing automatically routes new requests to the shortest queue.
 
-## 🧪 Benchmarking
 
-Reproduce the performance results yourself using the included benchmark suite.
-
-**1. Run the Comparison Benchark**
-This script runs both Baseline and SmartBatch scenarios sequentially and generates plots.
-```bash
-# usage: --users [NUM] --duration [TIME]
-venv/bin/python scripts/production_benchmark.py --users 200 --duration 1h
-```
-
-**2. View Results**
-The script will generate these files in your root directory:
-*   `production_throughput.png`
-*   `production_latency_p50.png`
-*   `production_latency_p95.png`
-
-## 📂 Project Structure
-
-```
-SmartBatch/
-├── smartbatch/          # Core Package
-│   ├── main.py          # Entry point & App lifecycle
-│   ├── api.py           # FastAPI endpoints
-│   ├── decorator.py     # Batching logic & Queue management
-│   ├── registry.py      # Model registry
-│   ├── model.py         # PyTorch Model Wrapper
-│   └── metrics.py       # Thread-safe metrics collection
-├── scripts/             # Utilities
-│   ├── production_benchmark.py # A/B Stress Test Script
-│   └── study_params.py  # Hyperparameter optimization
-├── tests/               # Testing
-│   ├── locustfile.py    # Load generator
-│   └── data/            # Test images (for realistic load)
-└── README.md            # Documentation
-```

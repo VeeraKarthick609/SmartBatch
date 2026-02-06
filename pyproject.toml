@@ -22,12 +22,7 @@ dependencies = [
     "numpy>=1.21.0",
 ]
 
-[project.optional-dependencies]
-test = [
-    "pytest",
-    "locust",
-    "requests"
-]
+
 
 [tool.setuptools.packages.find]
 where = ["."]

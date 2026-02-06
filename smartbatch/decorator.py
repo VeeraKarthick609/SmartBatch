@@ -1,6 +1,7 @@
 import asyncio
 import time
 import logging
+import inspect
 from typing import Callable, List, Any, Optional, Union
 from functools import wraps
 from dataclasses import dataclass, field
@@ -19,6 +20,11 @@ class _BatchedRequest:
     future: asyncio.Future = field(compare=False)
 
 logging.basicConfig(level=logging.INFO)
+
+# Constants
+RETRY_SLEEP_INTERVAL = 0.05
+RETRY_TIMEOUT = 1.0
+WORKER_SHUTDOWN_TIMEOUT = 5.0
 
 class Batcher:
     """
@@ -71,7 +77,7 @@ class Batcher:
         self.shutdown_event.set()
         if self.worker_tasks:
             try:
-                await asyncio.wait_for(asyncio.gather(*self.worker_tasks), timeout=5.0)
+                await asyncio.wait_for(asyncio.gather(*self.worker_tasks), timeout=WORKER_SHUTDOWN_TIMEOUT)
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 pass
             
@@ -128,13 +134,13 @@ class Batcher:
         except asyncio.QueueFull:
             # Queue is full. Back off and retry with higher priority.
             logger.warning("Queue full, retrying with high priority...")
-            await asyncio.sleep(0.05) # Wait 50ms
+            await asyncio.sleep(RETRY_SLEEP_INTERVAL) # Wait 50ms
             
             # Retry with Priority 0 (High)
             req.priority = 0
             try:
                 # Wait up to 1s to squeeze in
-                await asyncio.wait_for(target_queue.put(req), timeout=1.0)
+                await asyncio.wait_for(target_queue.put(req), timeout=RETRY_TIMEOUT)
             except asyncio.TimeoutError:
                 # Still full after retry -> Hard Failure
                 raise OverloadedError("Service overloaded: Queue full after retry")
@@ -192,20 +198,22 @@ class Batcher:
                     try:
                         start_time = time.time()
                         # Call user function with optional worker_id injection
-                        try:
-                            if asyncio.iscoroutinefunction(self.func):
+                        
+                        # Inspect function signature once (or cache it if performance is critical, 
+                        # but for batch processing overhead is negligible)
+                        sig = inspect.signature(self.func)
+                        accepts_worker_id = "worker_id" in sig.parameters
+
+                        if asyncio.iscoroutinefunction(self.func):
+                            if accepts_worker_id:
                                 results = await self.func(inputs, worker_id=worker_id)
                             else:
+                                results = await self.func(inputs)
+                        else:
+                            if accepts_worker_id:
                                 results = await asyncio.to_thread(self.func, inputs, worker_id=worker_id)
-                        except TypeError as te:
-                             if "worker_id" in str(te):
-                                 # Function doesn't accept worker_id
-                                 if asyncio.iscoroutinefunction(self.func):
-                                     results = await self.func(inputs)
-                                 else:
-                                     results = await asyncio.to_thread(self.func, inputs)
-                             else:
-                                 raise te
+                            else:
+                                results = await asyncio.to_thread(self.func, inputs)
 
                         exec_duration = time.time() - start_time
                         logger.debug(f"Batch size: {len(batch)}, Duration: {exec_duration:.4f}s, Target: {self.target_latency}")

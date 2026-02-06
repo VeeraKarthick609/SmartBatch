@@ -22,11 +22,11 @@ We conducted a rigorous stress test comparing **SmartBatch** against a **Baselin
 **Payload**: Real-world images (ResNet18 inputs)
 
 ### Latency vs Cumulative Requests
-![Latency Comparison](assets/comparison_latency_requests.png)
+![Latency Comparison](assets/production_latency_p50.png)
 *Stable latency even as request count grows, unlike the baseline which collapses.*
 
 ### Throughput vs Cumulative Requests
-![Throughput Comparison](assets/comparison_throughput_requests.png)
+![Throughput Comparison](assets/production_throughput.png)
 *Higher and more consistent throughput.*
 
 | Metric | Baseline (Sequential) | SmartBatch (Batched) | Improvement |
@@ -38,6 +38,13 @@ We conducted a rigorous stress test comparing **SmartBatch** against a **Baselin
 ---
 
 ## 🛠️ Installation
+
+You can install SmartBatch via pip:
+```bash
+pip install smartbatch
+```
+
+**Or install from source:**
 
 1.  **Clone the repository**:
     ```bash

@@ -24,7 +24,54 @@ logging.basicConfig(level=logging.INFO)
 # Constants
 RETRY_SLEEP_INTERVAL = 0.05
 RETRY_TIMEOUT = 1.0
+RETRY_TIMEOUT = 1.0
 WORKER_SHUTDOWN_TIMEOUT = 5.0
+CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5
+CIRCUIT_BREAKER_RECOVERY_TIMEOUT = 10.0
+
+class CircuitBreakerState:
+    CLOSED = "CLOSED"
+    OPEN = "OPEN"
+    HALF_OPEN = "HALF_OPEN"
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold: int = CIRCUIT_BREAKER_FAILURE_THRESHOLD, 
+                 recovery_timeout: float = CIRCUIT_BREAKER_RECOVERY_TIMEOUT):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.state = CircuitBreakerState.CLOSED
+        self.failures = 0
+        self.last_failure_time = 0.0
+
+    def record_failure(self):
+        self.failures += 1
+        self.last_failure_time = time.time()
+        if self.failures >= self.failure_threshold:
+            self.state = CircuitBreakerState.OPEN
+            logger.error(f"Circuit Breaker OPENED after {self.failures} failures.")
+
+    def record_success(self):
+        if self.state == CircuitBreakerState.HALF_OPEN:
+            self.state = CircuitBreakerState.CLOSED
+            self.failures = 0
+            logger.info("Circuit Breaker CLOSED (Recovery successful).")
+        elif self.state == CircuitBreakerState.CLOSED:
+             self.failures = 0
+
+    def can_proceed(self) -> bool:
+        if self.state == CircuitBreakerState.CLOSED:
+            return True
+        elif self.state == CircuitBreakerState.OPEN:
+            if time.time() - self.last_failure_time > self.recovery_timeout:
+                self.state = CircuitBreakerState.HALF_OPEN
+                logger.warning("Circuit Breaker HALF_OPEN (Probing).")
+                return True
+            return False
+        elif self.state == CircuitBreakerState.HALF_OPEN:
+            # Simple allow single request or all? Let's allow all in half-open for now, 
+            # but usually you'd want rate limiting here.
+            return True
+        return True
 
 class Batcher:
     """
@@ -61,6 +108,9 @@ class Batcher:
         self.worker_tasks: List[asyncio.Task] = []
         # Moving average for adaptive batching
         self.recent_latencies: deque = deque(maxlen=10)
+        
+        # Fault Isolation
+        self.circuit_breaker = CircuitBreaker()
 
         
     async def start(self):
@@ -99,6 +149,9 @@ class Batcher:
                  raise TypeError(f"Expected {self.input_schema.__name__}, got {type(item)}")
 
         # Ensure worker is running
+        if not self.circuit_breaker.can_proceed():
+             raise OverloadedError("Service temporarily unavailable (Circuit Breaker OPEN)")
+
         if not self.worker_tasks:
             await self.start()
             
@@ -244,12 +297,21 @@ class Batcher:
                         for req, res in zip(batch, results):
                             if not req.future.done():
                                 req.future.set_result(res)
+                        
+                        # Successful batch
+                        self.circuit_breaker.record_success()
                                 
                     except Exception as e:
-                        logger.error(f"Batch processing failed: {e}")
-                        for req in batch:
-                            if not req.future.done():
-                                req.future.set_exception(e)
+                        logger.error(f"Batch processing failed: {e}. Attempting recovery/fallback.")
+                        # Partial Failure / Fallback Strategy
+                        # We suspect one item might be causing the issue.
+                        # Strategy: Retry items individually (or in smaller chunks).
+                        
+                        # But first, record failure in circuit breaker
+                        self.circuit_breaker.record_failure()
+                        
+                        await self._process_fallback_individually(batch, worker_id)
+
                     finally:
                          batch = []
                          
@@ -258,6 +320,48 @@ class Batcher:
             except Exception as e:
                 logger.error(f"Worker {worker_id} crashed: {e}")
                 await asyncio.sleep(1)
+
+    async def _process_fallback_individually(self, batch: List[_BatchedRequest], worker_id: int):
+        """
+        Fallback mechanism: Process each item in the failed batch individually.
+        This isolates the failure to the specific item(s) causing it.
+        """
+        logger.info(f"Fallback: Processing {len(batch)} items individually.")
+        for req in batch:
+            if req.future.done():
+                continue
+                
+            try:
+                # Process single item
+                single_batch = [req.payload]
+                
+                # We need to call the user function.
+                # NOTE: This assumes the user function handles list of length 1 correctly.
+                # Most batch functions should.
+                
+                # .. duplicate call logic ..
+                sig = inspect.signature(self.func)
+                accepts_worker_id = "worker_id" in sig.parameters
+
+                if asyncio.iscoroutinefunction(self.func):
+                    if accepts_worker_id:
+                        results = await self.func(single_batch, worker_id=worker_id)
+                    else:
+                        results = await self.func(single_batch)
+                else:
+                    if accepts_worker_id:
+                        results = await asyncio.to_thread(self.func, single_batch, worker_id=worker_id)
+                    else:
+                        results = await asyncio.to_thread(self.func, single_batch)
+
+                if len(results) != 1:
+                     raise ValueError(f"Fallback expected 1 result, got {len(results)}")
+                
+                req.future.set_result(results[0])
+                
+            except Exception as e:
+                logger.error(f"Fallback failed for specific item: {e}")
+                req.future.set_exception(e)
 
 def batch(max_batch_size: int = 32, 
           max_wait_time: float = 0.01, 

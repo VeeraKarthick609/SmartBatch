@@ -3,8 +3,8 @@ import uuid
 import time
 import os
 import logging
-from typing import List, Any
-from fastapi import APIRouter, HTTPException, status
+from typing import List, Any, Optional
+from fastapi import APIRouter, HTTPException, status, Query
 from pydantic import BaseModel
 from smartbatch.decorator import batch
 from smartbatch.model import ModelWrapper
@@ -21,6 +21,14 @@ router = APIRouter()
 
 from starlette.responses import Response
 from prometheus_client import CONTENT_TYPE_LATEST
+
+@router.get("/admin/models")
+def list_models():
+    """
+    List all registered models and their versions.
+    """
+    from smartbatch.registry import get_all_models
+    return get_all_models()
 
 @router.get("/metrics")
 def metrics_endpoint():
@@ -46,15 +54,20 @@ async def predict_deprecated(request: Request):
     raise HTTPException(status_code=400, detail="Use /models/{name}/predict")
 
 @router.post("/models/{model_name}/predict", response_model=PredictResponse)
-async def predict_model(model_name: str, request: PredictRequest):
+async def predict_model(model_name: str, request: PredictRequest, version: str = Query(None)):
     """
     Dynamic endpoint for registered models.
+    Optional 'version' query parameter to target specific version.
     """
     from smartbatch.registry import get_model
     
-    handler = get_model(model_name)
+    handler = get_model(model_name, version=version)
     if not handler:
-        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
+        detail = f"Model '{model_name}'"
+        if version:
+            detail += f" version '{version}'"
+        detail += " not found"
+        raise HTTPException(status_code=404, detail=detail)
         
     request_id = str(uuid.uuid4())
     start_time = time.time()

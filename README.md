@@ -78,6 +78,14 @@ pip install smartbatch
     pip install .
     ```
 
+## 🧪 ResNet Example Suite
+
+A full ResNet-based sample setup is available in `.examples/`:
+
+- `.examples/resnet_server.py` (versioned SmartBatch model service)
+- `.examples/resnet_client.py` (concurrent JSON/MsgPack load client)
+- `.examples/README.md` (run instructions)
+
 ## 🏃 Usage
 
 ### 1. The Decorator Pattern (Recommended)

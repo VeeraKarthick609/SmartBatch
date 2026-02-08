@@ -1,0 +1,2 @@
+torchvision>=0.15.0
+requests>=2.28.0

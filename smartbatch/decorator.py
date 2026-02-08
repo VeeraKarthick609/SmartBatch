@@ -24,10 +24,38 @@ logging.basicConfig(level=logging.INFO)
 # Constants
 RETRY_SLEEP_INTERVAL = 0.05
 RETRY_TIMEOUT = 1.0
-RETRY_TIMEOUT = 1.0
 WORKER_SHUTDOWN_TIMEOUT = 5.0
 CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5
 CIRCUIT_BREAKER_RECOVERY_TIMEOUT = 10.0
+
+class MetricTracker:
+    def __init__(self, window_size: int = 50):
+        self.window_size = window_size
+        self.values = deque(maxlen=window_size)
+        self.times = deque(maxlen=window_size)
+    
+    def add(self, value: float, count: int = 1):
+        """Add value(s). For rate calculation, count represents number of events."""
+        now = time.time()
+        for _ in range(count):
+            self.values.append(value)
+            self.times.append(now)
+
+    def get_rate(self) -> float:
+        """Calculate rate (items/sec) based on window."""
+        if len(self.times) < 2:
+            return 0.0
+        duration = self.times[-1] - self.times[0]
+        if duration <= 1e-6: # Avoid div by zero
+            return 0.0
+        return len(self.times) / duration
+
+    def get_p95(self) -> float:
+        if not self.values:
+            return 0.0
+        sorted_vals = sorted(self.values)
+        index = int(0.95 * len(sorted_vals))
+        return sorted_vals[min(index, len(sorted_vals) - 1)]
 
 class CircuitBreakerState:
     CLOSED = "CLOSED"
@@ -106,8 +134,9 @@ class Batcher:
 
         self.shutdown_event = asyncio.Event()
         self.worker_tasks: List[asyncio.Task] = []
-        # Moving average for adaptive batching
-        self.recent_latencies: deque = deque(maxlen=10)
+        # Metrics for adaptive batching and admission control
+        self.processing_latencies = MetricTracker(window_size=20)
+        self.throughput_tracker = MetricTracker(window_size=50) # Track items processed per second
         
         # Fault Isolation
         self.circuit_breaker = CircuitBreaker()
@@ -151,6 +180,22 @@ class Batcher:
         # Ensure worker is running
         if not self.circuit_breaker.can_proceed():
              raise OverloadedError("Service temporarily unavailable (Circuit Breaker OPEN)")
+
+        # Admission Control (Little's Law)
+        # Estimated Wait = Total Queue Size / Throughput
+        current_throughput = self.throughput_tracker.get_rate()
+        total_queued = sum(q.qsize() for q in self.queues)
+        
+        if current_throughput > 0:
+            sla_limit = self.max_wait_time + (self.target_latency or 0.1)
+            estimated_wait = total_queued / current_throughput
+            
+            # 1.5x grace factor to accommodate bursts
+            if estimated_wait > sla_limit * 1.5:
+                # Allow priority 0 (retry/high) to pass? 
+                # For now strict rejection to protect system.
+                if priority > 0:
+                    raise OverloadedError(f"System overloaded. Est wait {estimated_wait:.3f}s > limit {sla_limit*1.5:.3f}s")
 
         if not self.worker_tasks:
             await self.start()
@@ -272,24 +317,28 @@ class Batcher:
                         logger.debug(f"Batch size: {len(batch)}, Duration: {exec_duration:.4f}s, Target: {self.target_latency}")
 
                         # --- Adaptive Batching Logic ---
+                        # Update metrics
+                        self.processing_latencies.add(exec_duration)
+                        self.throughput_tracker.add(1, count=len(batch))
+
                         if self.target_latency:
-                             self.recent_latencies.append(exec_duration)
-                             avg_latency = sum(self.recent_latencies) / len(self.recent_latencies)
+                             p95_latency = self.processing_latencies.get_p95()
                              
                              # Multiplicative Decrease
-                             if avg_latency > self.target_latency:
+                             if p95_latency > self.target_latency:
                                  old_limit = self.current_batch_size_limit
                                  self.current_batch_size_limit = max(1, int(self.current_batch_size_limit * 0.8))
                                  if self.current_batch_size_limit != old_limit:
-                                     logger.info(f"High latency (avg {avg_latency:.3f}s). Reducing batch size to {self.current_batch_size_limit}")
-                                     self.recent_latencies.clear() # Reset to avoid double penalizing
+                                     logger.info(f"High P95 latency ({p95_latency:.3f}s). Reducing batch size to {self.current_batch_size_limit}")
+                                     # We don't clear metrics immediately to allow stabilization
                              
                              # Additive Increase
-                             elif avg_latency < self.target_latency * 0.8:
-                                  if self.current_batch_size_limit < self.max_batch_size:
-                                      self.current_batch_size_limit += 1 
-                                      logger.debug(f"Low latency. Increasing batch size to {self.current_batch_size_limit}")
-                                      # No clear here, gradual increase is fine
+                             # Only increase if we are meeting SLA comfortably AND utilizing current batch size
+                             elif p95_latency < self.target_latency * 0.8:
+                                  if len(batch) >= self.current_batch_size_limit * 0.8:
+                                      if self.current_batch_size_limit < self.max_batch_size:
+                                          self.current_batch_size_limit += 1 
+                                          logger.debug(f"Low latency. Increasing batch size to {self.current_batch_size_limit}")
                             
                         if len(results) != len(inputs):
                              raise ValueError(f"Batch function returned {len(results)} items, expected {len(inputs)}")

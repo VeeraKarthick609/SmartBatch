@@ -2,7 +2,7 @@ import asyncio
 import time
 import logging
 import inspect
-from typing import Callable, List, Any, Optional, Union
+from typing import Callable, List, Any, Optional
 from functools import wraps
 from dataclasses import dataclass, field
 from collections import deque
@@ -114,6 +114,9 @@ class Batcher:
                  max_queue_size: int = 128,
                  workers: int = 1,
                  target_latency: Optional[float] = None):
+        if workers < 1:
+            raise ValueError("workers must be >= 1")
+
         self.func = func
         self.max_batch_size = max_batch_size
         self.current_batch_size_limit = max_batch_size # Adaptive limit
@@ -127,13 +130,13 @@ class Batcher:
         # Priority 0 = High (Retry/VIP)
         # Priority 10 = Normal
         # Per-GPU/Worker queues
-        # Handle 0 workers case carefully (for testing backpressure)
         self.queues: List[asyncio.PriorityQueue[_BatchedRequest]] = [
-            asyncio.PriorityQueue(maxsize=max_queue_size) for _ in range(max(1, workers))
+            asyncio.PriorityQueue(maxsize=max_queue_size) for _ in range(workers)
         ]
 
         self.shutdown_event = asyncio.Event()
         self.worker_tasks: List[asyncio.Task] = []
+        self._lifecycle_lock = asyncio.Lock()
         # Metrics for adaptive batching and admission control
         self.processing_latencies = MetricTracker(window_size=20)
         self.throughput_tracker = MetricTracker(window_size=50) # Track items processed per second
@@ -143,22 +146,34 @@ class Batcher:
 
         
     async def start(self):
-        # Clean up finished tasks
-        self.worker_tasks = [t for t in self.worker_tasks if not t.done()]
-        
-        if not self.worker_tasks:
-            self.shutdown_event.clear()
-            for i in range(self.workers):
-                t = asyncio.create_task(self._worker_loop(worker_id=i))
-                self.worker_tasks.append(t)
+        async with self._lifecycle_lock:
+            # Clean up finished tasks
+            self.worker_tasks = [t for t in self.worker_tasks if not t.done()]
+            
+            if not self.worker_tasks:
+                self.shutdown_event.clear()
+                for i in range(self.workers):
+                    t = asyncio.create_task(self._worker_loop(worker_id=i))
+                    self.worker_tasks.append(t)
             
     async def stop(self):
-        self.shutdown_event.set()
-        if self.worker_tasks:
+        async with self._lifecycle_lock:
+            self.shutdown_event.set()
+            if not self.worker_tasks:
+                return
+
+            tasks = list(self.worker_tasks)
             try:
-                await asyncio.wait_for(asyncio.gather(*self.worker_tasks), timeout=WORKER_SHUTDOWN_TIMEOUT)
-            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                pass
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=WORKER_SHUTDOWN_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                self.worker_tasks = []
             
     async def process_single(self, item: Any, priority: int = 10):
         """
@@ -197,8 +212,7 @@ class Batcher:
                 if priority > 0:
                     raise OverloadedError(f"System overloaded. Est wait {estimated_wait:.3f}s > limit {sla_limit*1.5:.3f}s")
 
-        if not self.worker_tasks:
-            await self.start()
+        await self.start()
             
         loop = asyncio.get_running_loop()
         future = loop.create_future()
@@ -215,9 +229,6 @@ class Batcher:
         # Load Balancing: Find shortest queue
         # For approximation, we just check qsize. 
         # In high concurrency, this is racy but acceptable.
-        
-        # If workers=0 (testing), we just use queue[0]
-        # But we need to simulate load balancing if workers > 1.
         
         best_queue_idx = 0
         if self.workers > 1:

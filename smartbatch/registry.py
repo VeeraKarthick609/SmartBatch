@@ -1,5 +1,6 @@
-from typing import Dict, Callable, Any, Optional, List
+from typing import Dict, Callable, Optional, List, Tuple
 from dataclasses import dataclass
+import re
 
 @dataclass
 class ModelMetadata:
@@ -10,6 +11,15 @@ class ModelMetadata:
 # Global registry: Model Name -> Checkpoint/Version -> ModelMetadata
 # _registry[model_name][version] = ModelMetadata
 _registry: Dict[str, Dict[str, ModelMetadata]] = {}
+
+
+def _version_sort_key(version: str) -> Tuple[Tuple[int, object], ...]:
+    """
+    Natural sort key for versions such as v1, v2, v10.
+    Numeric fragments are compared numerically.
+    """
+    parts = re.findall(r"\d+|[^\d]+", version)
+    return tuple((0, int(part)) if part.isdigit() else (1, part.lower()) for part in parts)
 
 def register(name: str, version: str = "v1"):
     """
@@ -31,9 +41,8 @@ def register(name: str, version: str = "v1"):
 def get_model(name: str, version: str = None) -> Optional[Callable]:
     """
     Get the model handler.
-    If version is None, returns the Handler for the latest registered version (lexicographically max) 
-    OR essentially just the first one marked active if we had status logic.
-    For simplicity: max version string.
+    If version is None, returns the handler for the latest registered version using
+    natural ordering (e.g., v10 > v9).
     """
     if name not in _registry:
         return None
@@ -46,9 +55,9 @@ def get_model(name: str, version: str = None) -> Optional[Callable]:
         meta = versions.get(version)
         return meta.handler if meta else None
     else:
-        # Default: Latest version (lexicographically)
+        # Default: Latest version (natural ordering, e.g., v10 > v9)
         # In a real system, you'd track "active" or "default" tag.
-        latest_version = max(versions.keys())
+        latest_version = max(versions.keys(), key=_version_sort_key)
         return versions[latest_version].handler
 
 def get_model_versions(name: str) -> List[str]:

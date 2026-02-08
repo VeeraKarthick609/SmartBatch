@@ -1,13 +1,12 @@
-import asyncio
 import uuid
 import time
-import os
 import logging
-from typing import List, Any, Optional
-from fastapi import APIRouter, HTTPException, status, Query
-from pydantic import BaseModel
-from smartbatch.decorator import batch
-from smartbatch.model import ModelWrapper
+from typing import Any, Optional
+from fastapi import APIRouter, HTTPException, status, Query, Request
+from pydantic import BaseModel, ValidationError
+from starlette.responses import Response
+from prometheus_client import CONTENT_TYPE_LATEST
+import msgpack
 from smartbatch.metrics import get_metrics
 from smartbatch.exceptions import OverloadedError
 
@@ -18,9 +17,6 @@ router = APIRouter()
 # API configuration can go here (e.g. auth middleware)
 
 # --- API Endpoints ---
-
-from starlette.responses import Response
-from prometheus_client import CONTENT_TYPE_LATEST
 
 @router.get("/admin/models")
 def list_models():
@@ -43,8 +39,39 @@ class PredictResponse(BaseModel):
     request_id: str
     processing_time: float
 
-from fastapi import Request
-import msgpack
+async def _extract_request_data(request: Request) -> Any:
+    """
+    Supports JSON payloads {"data": ...} and MsgPack payloads:
+    - {"data": ...}
+    - raw value (e.g. list) for high-performance clients.
+    """
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+
+    if content_type == "application/msgpack":
+        raw_body = await request.body()
+        if not raw_body:
+            raise HTTPException(status_code=400, detail="Empty MsgPack body")
+        try:
+            payload = msgpack.unpackb(raw_body, raw=False)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid MsgPack payload: {exc}") from exc
+
+        if isinstance(payload, dict):
+            try:
+                return PredictRequest.model_validate(payload).data
+            except ValidationError as exc:
+                raise HTTPException(status_code=422, detail=exc.errors()) from exc
+        return payload
+
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {exc}") from exc
+
+    try:
+        return PredictRequest.model_validate(payload).data
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
 
 @router.post("/predict")
 async def predict_deprecated(request: Request):
@@ -54,7 +81,7 @@ async def predict_deprecated(request: Request):
     raise HTTPException(status_code=400, detail="Use /models/{name}/predict")
 
 @router.post("/models/{model_name}/predict", response_model=PredictResponse)
-async def predict_model(model_name: str, request: PredictRequest, version: str = Query(None)):
+async def predict_model(model_name: str, request: Request, version: Optional[str] = Query(default=None)):
     """
     Dynamic endpoint for registered models.
     Optional 'version' query parameter to target specific version.
@@ -74,7 +101,8 @@ async def predict_model(model_name: str, request: PredictRequest, version: str =
     
     try:
         # Call the registered handler (which should be decorated with @batch)
-        result = await handler(request.data)
+        input_data = await _extract_request_data(request)
+        result = await handler(input_data)
         
         duration = time.time() - start_time
         get_metrics().record_request(duration)
@@ -84,7 +112,9 @@ async def predict_model(model_name: str, request: PredictRequest, version: str =
             request_id=request_id,
             processing_time=duration
         )
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Inference failed for {request_id} on model {model_name}: {e}")
         status_code = status.HTTP_500_INTERNAL_SERVER_ERROR

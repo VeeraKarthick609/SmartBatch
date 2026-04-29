@@ -184,8 +184,12 @@ requests.post(
 
 ## Examples
 
-A full ResNet example is in `.examples/`:
+Three examples in `examples/`, ordered by complexity:
 
-- `.examples/resnet_server.py` — versioned SmartBatch model service
-- `.examples/resnet_client.py` — concurrent JSON/MsgPack load client
-- `.examples/README.md` — run instructions
+| Example | File | Requires |
+| :--- | :--- | :--- |
+| Quickstart | `quickstart_server.py` + `quickstart_client.py` | `smartbatch` only |
+| Dynamic registration | `dynamic_registration.py` | `smartbatch` only |
+| ResNet (production-realistic) | `resnet_server.py` + `resnet_client.py` | `torchvision` |
+
+See [`examples/README.md`](examples/README.md) for run instructions.

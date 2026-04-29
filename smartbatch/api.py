@@ -4,8 +4,6 @@ import logging
 from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, status, Query, Request
 from pydantic import BaseModel, ValidationError
-from starlette.responses import Response
-from prometheus_client import CONTENT_TYPE_LATEST
 import msgpack
 from smartbatch.metrics import get_metrics
 from smartbatch.exceptions import OverloadedError
@@ -28,8 +26,7 @@ def list_models():
 
 @router.get("/metrics")
 def metrics_endpoint():
-    data = get_metrics().get_stats()
-    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
+    return get_metrics().get_stats()
 
 class PredictRequest(BaseModel):
     data: Any 

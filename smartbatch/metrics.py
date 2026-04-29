@@ -1,59 +1,46 @@
-from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 import time
+from collections import deque
 
-# --- Prometheus Metrics Definitions ---
-
-# Total number of requests received
-REQUEST_COUNT = Counter(
-    'smartbatch_requests_total', 
-    'Total number of inference requests',
-    ['status'] # generic status label (success/error)
-)
-
-# Latency of individual requests (End-to-End)
-REQUEST_LATENCY = Histogram(
-    'smartbatch_request_duration_seconds', 
-    'End-to-end request latency',
-    buckets=[0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]
-)
-
-# Batch size distribution
-BATCH_SIZE = Histogram(
-    'smartbatch_batch_size', 
-    'Distribution of batch sizes processed',
-    buckets=[1, 4, 8, 16, 32, 64, 128]
-)
-
-# Processing time for the actual model inference (GPU time)
-BATCH_LATENCY = Histogram(
-    'smartbatch_batch_processing_seconds', 
-    'Time taken for model inference batch processing'
-)
 
 class SystemMetrics:
-    """
-    Wrapper to maintain backward compatibility or helper methods
-    But primarily just writes to the global Prometheus registry.
-    """
-    
+    def __init__(self, window_size: int = 200):
+        self._latencies: deque = deque(maxlen=window_size)
+        self._total_requests: int = 0
+        self._total_errors: int = 0
+        self._start_time: float = time.time()
+
     def record_request(self, latency: float, status: str = "success"):
-        REQUEST_COUNT.labels(status=status).inc()
-        REQUEST_LATENCY.observe(latency)
+        self._latencies.append(latency)
+        self._total_requests += 1
+        if status != "success":
+            self._total_errors += 1
 
     def record_batch(self, batch_size: int, inference_time: float):
-        BATCH_SIZE.observe(batch_size)
-        BATCH_LATENCY.observe(inference_time)
+        pass  # kept for API compatibility; batch stats live in Batcher.processing_latencies
 
-    def get_stats(self):
-        """
-        Returns Prometheus formatted metrics string.
-        """
-        # Note: In a real app, you return Response(content, media_type)
-        # But our api.py endpoint handles the wrapping, we just return raw bytes or wrapper
-        return generate_latest()
+    def get_stats(self) -> dict:
+        latencies = sorted(self._latencies)
+        n = len(latencies)
 
-# Global singleton
+        def percentile(p: float) -> float:
+            if not latencies:
+                return 0.0
+            idx = min(int(p * n), n - 1)
+            return round(latencies[idx], 4)
+
+        uptime = round(time.time() - self._start_time, 1)
+        return {
+            "uptime_seconds": uptime,
+            "total_requests": self._total_requests,
+            "total_errors": self._total_errors,
+            "latency_p50": percentile(0.50),
+            "latency_p95": percentile(0.95),
+            "latency_p99": percentile(0.99),
+        }
+
+
 metrics = SystemMetrics()
 
-def get_metrics():
+
+def get_metrics() -> SystemMetrics:
     return metrics

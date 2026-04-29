@@ -1,3 +1,4 @@
+import importlib
 import uuid
 import time
 import logging
@@ -18,11 +19,66 @@ router = APIRouter()
 
 @router.get("/admin/models")
 def list_models():
-    """
-    List all registered models and their versions.
-    """
     from smartbatch.registry import get_all_models
     return get_all_models()
+
+
+class RegisterRequest(BaseModel):
+    module: str
+    function: str
+    version: str = "v1"
+    max_batch_size: int = 32
+    max_wait_time: float = 0.01
+    max_queue_size: int = 128
+    workers: int = 1
+    target_latency: Optional[float] = None
+
+
+@router.post("/admin/models/{name}", status_code=status.HTTP_201_CREATED)
+def register_model(name: str, req: RegisterRequest):
+    """
+    Dynamically register a batch function from an importable module.
+
+    The function must accept List[Any] and return List[Any] of the same length.
+    Example body:
+        {"module": "myapp.models", "function": "infer", "version": "v2"}
+    """
+    from smartbatch.registry import register
+    from smartbatch.decorator import batch
+
+    try:
+        mod = importlib.import_module(req.module)
+    except ModuleNotFoundError as e:
+        raise HTTPException(status_code=400, detail=f"Cannot import module '{req.module}': {e}")
+
+    func = getattr(mod, req.function, None)
+    if func is None:
+        raise HTTPException(status_code=400, detail=f"Function '{req.function}' not found in '{req.module}'")
+    if not callable(func):
+        raise HTTPException(status_code=400, detail=f"'{req.function}' is not callable")
+
+    batched = batch(
+        max_batch_size=req.max_batch_size,
+        max_wait_time=req.max_wait_time,
+        max_queue_size=req.max_queue_size,
+        workers=req.workers,
+        target_latency=req.target_latency,
+    )(func)
+
+    register(name=name, version=req.version)(batched)
+
+    logger.info(f"Dynamically registered '{name}' version '{req.version}' from {req.module}.{req.function}")
+    return {"name": name, "version": req.version, "module": req.module, "function": req.function}
+
+
+@router.delete("/admin/models/{name}/{version}", status_code=status.HTTP_200_OK)
+def deregister_model(name: str, version: str):
+    from smartbatch.registry import deregister
+    removed = deregister(name, version)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"Model '{name}' version '{version}' not found")
+    logger.info(f"Deregistered '{name}' version '{version}'")
+    return {"name": name, "version": version, "status": "removed"}
 
 @router.get("/metrics")
 def metrics_endpoint():

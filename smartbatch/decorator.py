@@ -7,6 +7,7 @@ from functools import wraps
 from dataclasses import dataclass, field
 from collections import deque
 from smartbatch.exceptions import OverloadedError
+from smartbatch.metrics import get_metrics
 
 logger = logging.getLogger("smartbatch.decorator")
 
@@ -32,23 +33,23 @@ class MetricTracker:
     def __init__(self, window_size: int = 50):
         self.window_size = window_size
         self.values = deque(maxlen=window_size)
-        self.times = deque(maxlen=window_size)
-    
+        # Each entry is (timestamp, event_count) for a single add() call
+        self._batches: deque = deque(maxlen=window_size)
+
     def add(self, value: float, count: int = 1):
-        """Add value(s). For rate calculation, count represents number of events."""
         now = time.time()
-        for _ in range(count):
-            self.values.append(value)
-            self.times.append(now)
+        self.values.append(value)
+        self._batches.append((now, count))
 
     def get_rate(self) -> float:
-        """Calculate rate (items/sec) based on window."""
-        if len(self.times) < 2:
+        """Items per second across the recorded window."""
+        if len(self._batches) < 2:
             return 0.0
-        duration = self.times[-1] - self.times[0]
-        if duration <= 1e-6: # Avoid div by zero
+        duration = self._batches[-1][0] - self._batches[0][0]
+        if duration <= 1e-6:
             return 0.0
-        return len(self.times) / duration
+        total_events = sum(c for _, c in self._batches)
+        return total_events / duration
 
     def get_p95(self) -> float:
         if not self.values:
@@ -83,8 +84,6 @@ class CircuitBreaker:
             self.state = CircuitBreakerState.CLOSED
             self.failures = 0
             logger.info("Circuit Breaker CLOSED (Recovery successful).")
-        elif self.state == CircuitBreakerState.CLOSED:
-             self.failures = 0
 
     def can_proceed(self) -> bool:
         if self.state == CircuitBreakerState.CLOSED:
@@ -241,20 +240,19 @@ class Batcher:
         target_queue = self.queues[best_queue_idx]
 
         try:
-            # Try to enqueue immediately
             target_queue.put_nowait(req)
         except asyncio.QueueFull:
-            # Queue is full. Back off and retry with higher priority.
             logger.warning("Queue full, retrying with high priority...")
-            await asyncio.sleep(RETRY_SLEEP_INTERVAL) # Wait 50ms
-            
-            # Retry with Priority 0 (High)
+            await asyncio.sleep(RETRY_SLEEP_INTERVAL)
+
+            # Re-select shortest queue and bump priority so this request
+            # is served before normal-priority items already waiting.
             req.priority = 0
+            best_queue_idx = min(range(len(self.queues)), key=lambda i: self.queues[i].qsize())
+            target_queue = self.queues[best_queue_idx]
             try:
-                # Wait up to 1s to squeeze in
                 await asyncio.wait_for(target_queue.put(req), timeout=RETRY_TIMEOUT)
             except asyncio.TimeoutError:
-                # Still full after retry -> Hard Failure
                 raise OverloadedError("Service overloaded: Queue full after retry")
         
         return await future
@@ -329,6 +327,7 @@ class Batcher:
                         # Update metrics
                         self.processing_latencies.add(exec_duration)
                         self.throughput_tracker.add(1, count=len(batch))
+                        get_metrics().record_batch(len(batch), exec_duration)
 
                         if self.target_latency:
                              p95_latency = self.processing_latencies.get_p95()

@@ -69,6 +69,15 @@ def get_all_models() -> Dict[str, List[str]]:
     """Returns Dict[ModelName, List[Versions]]"""
     return {name: list(versions.keys()) for name, versions in _registry.items()}
 
+def deregister(name: str, version: str) -> bool:
+    """Remove a specific model version. Returns True if it existed."""
+    if name not in _registry or version not in _registry[name]:
+        return False
+    del _registry[name][version]
+    if not _registry[name]:
+        del _registry[name]
+    return True
+
 def reset_registry():
     """Clear the registry. Useful for testing."""
     _registry.clear()

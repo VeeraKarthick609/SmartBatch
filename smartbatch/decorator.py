@@ -144,6 +144,9 @@ class Batcher:
         # Fault Isolation
         self.circuit_breaker = CircuitBreaker()
 
+        self._accepts_worker_id = "worker_id" in inspect.signature(func).parameters
+        self._is_async = asyncio.iscoroutinefunction(func)
+
         
     async def start(self):
         async with self._lifecycle_lock:
@@ -308,18 +311,13 @@ class Batcher:
                         start_time = time.time()
                         # Call user function with optional worker_id injection
                         
-                        # Inspect function signature once (or cache it if performance is critical, 
-                        # but for batch processing overhead is negligible)
-                        sig = inspect.signature(self.func)
-                        accepts_worker_id = "worker_id" in sig.parameters
-
-                        if asyncio.iscoroutinefunction(self.func):
-                            if accepts_worker_id:
+                        if self._is_async:
+                            if self._accepts_worker_id:
                                 results = await self.func(inputs, worker_id=worker_id)
                             else:
                                 results = await self.func(inputs)
                         else:
-                            if accepts_worker_id:
+                            if self._accepts_worker_id:
                                 results = await asyncio.to_thread(self.func, inputs, worker_id=worker_id)
                             else:
                                 results = await asyncio.to_thread(self.func, inputs)
@@ -400,16 +398,13 @@ class Batcher:
                 # Most batch functions should.
                 
                 # .. duplicate call logic ..
-                sig = inspect.signature(self.func)
-                accepts_worker_id = "worker_id" in sig.parameters
-
-                if asyncio.iscoroutinefunction(self.func):
-                    if accepts_worker_id:
+                if self._is_async:
+                    if self._accepts_worker_id:
                         results = await self.func(single_batch, worker_id=worker_id)
                     else:
                         results = await self.func(single_batch)
                 else:
-                    if accepts_worker_id:
+                    if self._accepts_worker_id:
                         results = await asyncio.to_thread(self.func, single_batch, worker_id=worker_id)
                     else:
                         results = await asyncio.to_thread(self.func, single_batch)

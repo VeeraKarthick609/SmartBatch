@@ -1,5 +1,5 @@
 """
-Quickstart client — sends concurrent requests to the quickstart server.
+Quickstart client — exercises all three models on the quickstart server.
 
 Run the server first:
     python examples/quickstart_server.py
@@ -23,6 +23,10 @@ def post(path: str, payload: dict) -> dict:
     return r.json()
 
 
+# ---------------------------------------------------------------------------
+# Standard batch demos
+# ---------------------------------------------------------------------------
+
 def demo_square():
     print("\n--- square: 16 concurrent requests ---")
     inputs = list(range(16))
@@ -37,7 +41,7 @@ def demo_square():
     elapsed = time.perf_counter() - start
 
     for x in inputs:
-        print(f"  square({x}) = {results[x]}")
+        print(f"  square({x:2d}) = {results[x]}")
     print(f"  Wall time: {elapsed:.3f}s")
 
 
@@ -56,7 +60,10 @@ def demo_word_count():
 
     start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = {ex.submit(post, "/models/word-count/predict", {"data": {"text": s}}): s for s in sentences}
+        futures = {
+            ex.submit(post, "/models/word-count/predict", {"data": {"text": s}}): s
+            for s in sentences
+        }
         for f in as_completed(futures):
             s = futures[f]
             print(f"  {f.result()['result']} words: \"{s}\"")
@@ -64,13 +71,69 @@ def demo_word_count():
     print(f"  Wall time: {elapsed:.3f}s")
 
 
+# ---------------------------------------------------------------------------
+# Streaming demo
+# ---------------------------------------------------------------------------
+
+def stream_tokens(topic: str) -> list[str]:
+    """
+    Call POST /models/storyteller/stream and collect tokens via SSE.
+    Returns the full list of tokens received.
+    """
+    tokens = []
+    with requests.post(
+        f"{BASE_URL}/models/storyteller/stream",
+        json={"data": topic},
+        stream=True,
+        timeout=30,
+    ) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            line = line.decode() if isinstance(line, bytes) else line
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if payload == "[DONE]":
+                break
+            event = json.loads(payload)
+            if "error" in event:
+                raise RuntimeError(f"Stream error: {event['error']}")
+            tokens.append(event["token"])
+    return tokens
+
+
+def demo_streaming():
+    print("\n--- storyteller: 4 concurrent streaming requests ---")
+    topics = ["dragons", "quantum computers", "the ocean", "ancient Rome"]
+
+    start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = {ex.submit(stream_tokens, topic): topic for topic in topics}
+        for f in as_completed(futures):
+            topic = futures[f]
+            tokens = f.result()
+            story = "".join(tokens)
+            print(f"\n  [{topic}]\n  {story}")
+    elapsed = time.perf_counter() - start
+    print(f"\n  Wall time: {elapsed:.3f}s")
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
 def demo_metrics():
     print("\n--- /metrics ---")
     r = requests.get(f"{BASE_URL}/metrics", timeout=5)
     print(json.dumps(r.json(), indent=2))
 
 
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     demo_square()
     demo_word_count()
+    demo_streaming()
     demo_metrics()

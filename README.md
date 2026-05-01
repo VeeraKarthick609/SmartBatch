@@ -1,10 +1,11 @@
 # SmartBatch: High-Throughput Async Inference Middleware
 
-**SmartBatch** is a production-grade inference serving system designed to maximize GPU utilization and throughput for PyTorch models. It implements **Dynamic Batching** to group incoming requests on-the-fly, significantly reducing overhead compared to naive request-per-inference processing.
+**SmartBatch** is a production-grade inference serving system designed to maximize GPU utilization and throughput for ML models. It implements **Dynamic Batching** to group incoming requests on-the-fly, and **Streaming** to deliver token-by-token responses for LLM workloads — significantly reducing overhead compared to naive request-per-inference processing.
 
 ## Key Features
 
 - **Dynamic Batching**: Automatically groups requests into batches (up to `max_batch_size`) or flushes them after a timeout (`max_wait_time`).
+- **Streaming (SSE)**: Token-by-token responses via Server-Sent Events. Drop-in for LLM backends — works with vLLM, llama.cpp, or any async generator model.
 - **Latency-Aware Adaptive Batching**: Adjusts batch sizes at runtime using P95 latency to meet SLA targets (`target_latency`).
 - **Hard Backpressure**: Sheds load with HTTP 429 when queues are full, preventing cascading failures.
 - **Per-GPU Queues**: Strict worker isolation — a stall on one GPU does not block others.
@@ -14,6 +15,9 @@
 - **Observability**: `/metrics` endpoint with request counts, error rates, and latency/batch percentiles.
 
 ## Advanced Features
+
+### Streaming for LLMs
+SmartBatch batches concurrent LLM requests together at the prefill stage and streams each sequence's tokens back independently as they are generated. The `@streaming_batch` decorator wraps any async generator function — point it at your LLM's streaming API and SmartBatch handles the batching, queuing, backpressure, and SSE delivery.
 
 ### SLA-Aware Admission Control
 SmartBatch uses **Little's Law** to estimate wait time from current queue depth and throughput. Requests exceeding the SLA budget are rejected immediately with `429 Too Many Requests`, preventing queue-buildup spirals.
@@ -65,84 +69,102 @@ pip install .
 
 ## Usage
 
-### 1. Basic decorator
+### 1. Standard batch inference
 
 ```python
-from smartbatch import batch
+from smartbatch import batch, register
 from typing import List
 
+@register(name="yolo", version="v1")
 @batch(max_batch_size=32, max_wait_time=0.01, target_latency=0.05)
 async def run_model(batch_inputs: List[float]) -> List[float]:
     return model.predict(batch_inputs)
 
-# Call with a single item — batching happens automatically
-result = await run_model(single_input)
+# POST /models/yolo/predict  ->  {"data": 1.5}
 ```
 
-### 2. Multi-model registry
-
-Register multiple models (and versions) on dynamic routes:
+### 2. Streaming inference (LLM-style)
 
 ```python
-from smartbatch import batch, register
+from smartbatch import streaming_batch, register
+from typing import List, Optional
 
+@register(name="llama3", version="v1")
+@streaming_batch(max_batch_size=8, max_wait_time=0.05)
+async def generate(batch: List[str]):
+    # batch = list of prompts from concurrent requests
+    # yield List[Optional[str]]: one token per sequence, None when done
+    streams = [llm.astream(prompt) for prompt in batch]
+    active = [True] * len(batch)
+
+    while any(active):
+        tokens = []
+        for i, stream in enumerate(streams):
+            if active[i]:
+                try:
+                    tokens.append(await anext(stream))
+                except StopAsyncIteration:
+                    tokens.append(None)
+                    active[i] = False
+            else:
+                tokens.append(None)
+        yield tokens
+
+# POST /models/llama3/stream  ->  SSE token stream
+```
+
+**Reading the stream:**
+```python
+import json, requests
+
+with requests.post(
+    "http://localhost:8000/models/llama3/stream",
+    json={"data": "Tell me about dragons"},
+    stream=True,
+) as resp:
+    for line in resp.iter_lines():
+        line = line.decode()
+        if line.startswith("data:"):
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            print(json.loads(payload)["token"], end="", flush=True)
+```
+
+### 3. Multi-model registry with versioning
+
+```python
 @register(name="yolo", version="v1")
 @batch(max_batch_size=8)
-async def run_yolo_v1(batch: List):
-    return yolo_v1(batch)
+async def run_yolo_v1(batch): return yolo_v1(batch)
 
 @register(name="yolo", version="v2")
 @batch(max_batch_size=8)
-async def run_yolo_v2(batch: List):
-    return yolo_v2(batch)
+async def run_yolo_v2(batch): return yolo_v2(batch)
 
-# POST /models/yolo/predict        -> latest version (v2)
+# POST /models/yolo/predict           -> latest (v2)
 # POST /models/yolo/predict?version=v1 -> v1
 ```
 
-### 3. Dynamic registration via API
+### 4. Dynamic registration via API
 
-Register or remove models at runtime without restarting the server.
+Register or remove models at runtime without restarting the server:
 
-**Register**
 ```bash
-POST /admin/models/{name}
-Content-Type: application/json
-
+# Register
+POST /admin/models/my-model
 {
   "module": "myapp.models",
   "function": "infer",
   "version": "v2",
-  "max_batch_size": 16,
-  "max_wait_time": 0.01,
-  "workers": 1,
-  "target_latency": 0.05
+  "max_batch_size": 16
 }
+
+# Deregister
+DELETE /admin/models/my-model/v2
 ```
 
 The `module` must be importable in the server's Python environment. The function must accept `List[Any]` and return `List[Any]` of the same length.
-
-**Deregister**
-```bash
-DELETE /admin/models/{name}/{version}
-```
-
-### 4. Input schema validation
-
-Validate inputs with Pydantic before they enter the queue:
-
-```python
-from pydantic import BaseModel
-
-class ImageInput(BaseModel):
-    data: List[float]
-    threshold: float = 0.5
-
-@batch(max_batch_size=32, input_schema=ImageInput)
-async def safe_inference(batch: List[ImageInput]):
-    inputs = [item.data for item in batch]
-    return model.predict(inputs)
-```
 
 ### 5. Multi-GPU / multi-worker
 
@@ -154,7 +176,21 @@ async def infer(batch, worker_id=0):
     return models[worker_id](batch)
 ```
 
-### 6. MsgPack transport
+### 6. Input schema validation
+
+```python
+from pydantic import BaseModel
+
+class ImageInput(BaseModel):
+    data: List[float]
+    threshold: float = 0.5
+
+@batch(max_batch_size=32, input_schema=ImageInput)
+async def safe_inference(batch: List[ImageInput]):
+    return model.predict([item.data for item in batch])
+```
+
+### 7. MsgPack transport
 
 ```python
 import msgpack, requests
@@ -173,11 +209,12 @@ requests.post(
 
 | Method | Path | Description |
 | :--- | :--- | :--- |
-| `POST` | `/models/{name}/predict` | Run inference. Optional `?version=` query param. |
+| `POST` | `/models/{name}/predict` | Standard inference. Optional `?version=` query param. |
+| `POST` | `/models/{name}/stream` | Streaming inference via SSE. Optional `?version=` query param. |
 | `GET` | `/admin/models` | List all registered models and versions. |
 | `POST` | `/admin/models/{name}` | Dynamically register a model from an importable module. |
 | `DELETE` | `/admin/models/{name}/{version}` | Deregister a specific model version. |
-| `GET` | `/metrics` | JSON metrics: request counts, error rate, latency p50/p95/p99, batch stats. |
+| `GET` | `/metrics` | JSON: request counts, error rate, latency p50/p95/p99, batch stats. |
 | `GET` | `/health` | Health check. |
 
 ---
@@ -186,10 +223,10 @@ requests.post(
 
 Three examples in `examples/`, ordered by complexity:
 
-| Example | File | Requires |
+| Example | Files | Requires |
 | :--- | :--- | :--- |
-| Quickstart | `quickstart_server.py` + `quickstart_client.py` | `smartbatch` only |
+| Quickstart (batch + streaming) | `quickstart_server.py` + `quickstart_client.py` | `smartbatch` only |
 | Dynamic registration | `dynamic_registration.py` | `smartbatch` only |
 | ResNet (production-realistic) | `resnet_server.py` + `resnet_client.py` | `torchvision` |
 
-See [`examples/README.md`](examples/README.md) for run instructions.
+See [`examples/README.md`](examples/README.md) for full run instructions.

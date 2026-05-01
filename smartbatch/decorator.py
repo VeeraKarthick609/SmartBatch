@@ -15,10 +15,18 @@ logger = logging.getLogger("smartbatch.decorator")
 class _BatchedRequest:
     priority: int
     enqueue_time: float
-    # Future is not comparable, so we exclude it from ordering or place it last
-    # We use field(compare=False)
     payload: Any = field(compare=False)
     future: asyncio.Future = field(compare=False)
+
+@dataclass(order=True)
+class _StreamingRequest:
+    priority: int
+    enqueue_time: float
+    payload: Any = field(compare=False)
+    queue: asyncio.Queue = field(compare=False)
+
+_STREAM_DONE = object()   # sentinel: sequence finished
+_STREAM_ERROR = object()  # sentinel: (error_sentinel, exception)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -439,5 +447,231 @@ def batch(max_batch_size: int = 32,
             
         # Expose batcher control? e.g. wrapper.batcher = batcher
         wrapper.batcher = batcher
+        return wrapper
+    return decorator
+
+
+class StreamingBatcher:
+    """
+    Like Batcher, but for async-generator batch functions.
+
+    The wrapped function must be an async generator with this signature:
+        async def fn(batch: List[Any]) -> AsyncGenerator[List[Optional[str]], None]:
+            ...
+            yield [token_for_seq0, token_for_seq1, ...]  # None = that sequence is done
+
+    Each caller receives an asyncio.Queue. Tokens are pushed into it as they
+    are generated. _STREAM_DONE is pushed when the sequence finishes.
+    On error, (_STREAM_ERROR, exception) is pushed.
+    """
+
+    def __init__(self,
+                 func: Callable,
+                 max_batch_size: int,
+                 max_wait_time: float,
+                 max_queue_size: int = 128,
+                 workers: int = 1):
+        if workers < 1:
+            raise ValueError("workers must be >= 1")
+        if not inspect.isasyncgenfunction(func):
+            raise TypeError(
+                f"{func.__name__} must be an async generator function "
+                "(use 'async def' with 'yield')"
+            )
+
+        self.func = func
+        self.max_batch_size = max_batch_size
+        self.max_wait_time = max_wait_time
+        self.max_queue_size = max_queue_size
+        self.workers = workers
+
+        self.queues: List[asyncio.PriorityQueue] = [
+            asyncio.PriorityQueue(maxsize=max_queue_size) for _ in range(workers)
+        ]
+        self.shutdown_event = asyncio.Event()
+        self.worker_tasks: List[asyncio.Task] = []
+        self._lifecycle_lock = asyncio.Lock()
+
+    async def start(self):
+        async with self._lifecycle_lock:
+            self.worker_tasks = [t for t in self.worker_tasks if not t.done()]
+            if not self.worker_tasks:
+                self.shutdown_event.clear()
+                for i in range(self.workers):
+                    t = asyncio.create_task(self._worker_loop(worker_id=i))
+                    self.worker_tasks.append(t)
+
+    async def stop(self):
+        async with self._lifecycle_lock:
+            self.shutdown_event.set()
+            if not self.worker_tasks:
+                return
+            tasks = list(self.worker_tasks)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=WORKER_SHUTDOWN_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                for t in tasks:
+                    t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                self.worker_tasks = []
+
+    async def stream_single(self, item: Any, priority: int = 10) -> asyncio.Queue:
+        """
+        Enqueue one item and return a queue the caller can read tokens from.
+        Tokens are strings. _STREAM_DONE signals end-of-sequence.
+        (_STREAM_ERROR, exc) signals a failure.
+        """
+        await self.start()
+
+        token_queue: asyncio.Queue = asyncio.Queue()
+        req = _StreamingRequest(
+            priority=priority,
+            enqueue_time=time.time(),
+            payload=item,
+            queue=token_queue,
+        )
+
+        best = min(range(len(self.queues)), key=lambda i: self.queues[i].qsize())
+        target = self.queues[best]
+
+        try:
+            target.put_nowait(req)
+        except asyncio.QueueFull:
+            logger.warning("Streaming queue full, retrying with high priority...")
+            await asyncio.sleep(RETRY_SLEEP_INTERVAL)
+            req.priority = 0
+            best = min(range(len(self.queues)), key=lambda i: self.queues[i].qsize())
+            target = self.queues[best]
+            try:
+                await asyncio.wait_for(target.put(req), timeout=RETRY_TIMEOUT)
+            except asyncio.TimeoutError:
+                raise OverloadedError("Streaming service overloaded: queue full after retry")
+
+        return token_queue
+
+    async def _worker_loop(self, worker_id: int):
+        logger.info(f"Streaming worker {worker_id} started for {self.func.__name__}")
+        my_queue = self.queues[worker_id % len(self.queues)]
+
+        while not self.shutdown_event.is_set():
+            batch: List[_StreamingRequest] = []
+
+            # Wait for first item
+            try:
+                req = await asyncio.wait_for(my_queue.get(), timeout=1.0)
+                batch.append(req)
+            except asyncio.TimeoutError:
+                continue
+
+            # Accumulate up to max_batch_size within max_wait_time
+            deadline = time.time() + self.max_wait_time
+            while len(batch) < self.max_batch_size:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    try:
+                        while len(batch) < self.max_batch_size:
+                            batch.append(my_queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        pass
+                    break
+                try:
+                    req = await asyncio.wait_for(my_queue.get(), timeout=remaining)
+                    batch.append(req)
+                except asyncio.TimeoutError:
+                    break
+
+            if not batch:
+                continue
+
+            inputs = [r.payload for r in batch]
+            active = [True] * len(batch)
+
+            try:
+                async for token_list in self.func(inputs):
+                    if len(token_list) != len(batch):
+                        raise ValueError(
+                            f"Streaming function yielded {len(token_list)} tokens, "
+                            f"expected {len(batch)}"
+                        )
+                    for i, (req, token) in enumerate(zip(batch, token_list)):
+                        if not active[i]:
+                            continue
+                        if token is None:
+                            active[i] = False
+                            await req.queue.put(_STREAM_DONE)
+                        else:
+                            await req.queue.put(token)
+
+                    if not any(active):
+                        break
+
+                # Ensure any sequences not explicitly closed are closed
+                for req, is_active in zip(batch, active):
+                    if is_active:
+                        await req.queue.put(_STREAM_DONE)
+
+            except asyncio.CancelledError:
+                for req, is_active in zip(batch, active):
+                    if is_active:
+                        await req.queue.put((_STREAM_ERROR, asyncio.CancelledError()))
+                break
+            except Exception as e:
+                logger.error(f"Streaming worker {worker_id} batch failed: {e}")
+                for req, is_active in zip(batch, active):
+                    if is_active:
+                        await req.queue.put((_STREAM_ERROR, e))
+
+
+def streaming_batch(max_batch_size: int = 8,
+                    max_wait_time: float = 0.05,
+                    max_queue_size: int = 128,
+                    workers: int = 1):
+    """
+    Decorator for streaming (token-by-token) batch inference.
+
+    The decorated function must be an async generator that accepts List[Any]
+    and yields List[Optional[str]] — one token per sequence per step, None
+    when a sequence has finished generating.
+
+    Usage:
+        @register(name="llama3", version="v1")
+        @streaming_batch(max_batch_size=8, max_wait_time=0.05)
+        async def generate(batch: List[str]):
+            streams = [model.stream(prompt) for prompt in batch]
+            active = [True] * len(batch)
+            while any(active):
+                tokens = []
+                for i, stream in enumerate(streams):
+                    if active[i]:
+                        try:
+                            tokens.append(await anext(stream))
+                        except StopAsyncIteration:
+                            tokens.append(None)
+                            active[i] = False
+                    else:
+                        tokens.append(None)
+                yield tokens
+
+    Callers receive an asyncio.Queue; use POST /models/{name}/stream for HTTP.
+    """
+    def decorator(func):
+        batcher = StreamingBatcher(
+            func,
+            max_batch_size=max_batch_size,
+            max_wait_time=max_wait_time,
+            max_queue_size=max_queue_size,
+            workers=workers,
+        )
+
+        @wraps(func)
+        async def wrapper(item: Any) -> asyncio.Queue:
+            return await batcher.stream_single(item)
+
+        wrapper.batcher = batcher
+        wrapper.is_streaming = True
         return wrapper
     return decorator

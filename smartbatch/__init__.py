@@ -1,4 +1,4 @@
-from .decorator import batch
+from .decorator import batch, streaming_batch
 from .registry import register
 
-__all__ = ["batch", "register"]
+__all__ = ["batch", "streaming_batch", "register"]

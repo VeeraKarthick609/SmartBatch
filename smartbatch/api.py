@@ -1,13 +1,16 @@
 import importlib
+import json
 import uuid
 import time
 import logging
 from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, status, Query, Request
 from pydantic import BaseModel, ValidationError
+from starlette.responses import StreamingResponse
 import msgpack
 from smartbatch.metrics import get_metrics
 from smartbatch.exceptions import OverloadedError
+from smartbatch.decorator import _STREAM_DONE, _STREAM_ERROR
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -176,3 +179,71 @@ async def predict_model(model_name: str, request: Request, version: Optional[str
         elif "Server is shutting down" in str(e):
              status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         raise HTTPException(status_code=status_code, detail=str(e))
+
+
+@router.post("/models/{model_name}/stream")
+async def stream_model(model_name: str, request: Request, version: Optional[str] = Query(default=None)):
+    """
+    Streaming inference endpoint. Returns a Server-Sent Events (SSE) stream.
+
+    The registered handler must be decorated with @streaming_batch.
+
+    Each SSE event carries one token:
+        data: {"token": "...", "request_id": "..."}
+
+    The stream ends with:
+        data: [DONE]
+
+    On error:
+        data: {"error": "..."}
+    """
+    from smartbatch.registry import get_model
+
+    handler = get_model(model_name, version=version)
+    if not handler:
+        detail = f"Model '{model_name}'"
+        if version:
+            detail += f" version '{version}'"
+        detail += " not found"
+        raise HTTPException(status_code=404, detail=detail)
+
+    if not getattr(handler, "is_streaming", False):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{model_name}' does not support streaming. "
+                   "Use POST /models/{name}/predict instead.",
+        )
+
+    request_id = str(uuid.uuid4())
+
+    try:
+        input_data = await _extract_request_data(request)
+        token_queue = await handler(input_data)
+    except OverloadedError as e:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    async def event_stream():
+        start_time = time.time()
+        try:
+            while True:
+                item = await token_queue.get()
+
+                if item is _STREAM_DONE:
+                    yield "data: [DONE]\n\n"
+                    break
+
+                if isinstance(item, tuple) and len(item) == 2 and item[0] is _STREAM_ERROR:
+                    _, exc = item
+                    yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+                    break
+
+                yield f"data: {json.dumps({'token': item, 'request_id': request_id})}\n\n"
+
+        finally:
+            get_metrics().record_request(time.time() - start_time)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
